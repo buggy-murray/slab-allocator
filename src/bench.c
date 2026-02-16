@@ -229,6 +229,42 @@ static void bench_mt_churn(int nthreads, int rounds_per_thread, const char *labe
         slab_cache_destroy(c);
 }
 
+/* ── Steady-state benchmark (realistic workload) ── */
+
+static void bench_steady_state(int ops, int pool_size, const char *label,
+                                struct slab_cache *cache, int use_malloc)
+{
+    void **pool = calloc(pool_size, sizeof(void *));
+
+    /* Fill pool */
+    for (int i = 0; i < pool_size; i++) {
+        pool[i] = use_malloc ? malloc(OBJ_SIZE) : slab_alloc(cache);
+    }
+
+    /* Steady-state: free one, alloc one */
+    double t0 = now_ms();
+    for (int i = 0; i < ops; i++) {
+        int idx = i % pool_size;
+        if (use_malloc) {
+            free(pool[idx]);
+            pool[idx] = malloc(OBJ_SIZE);
+        } else {
+            slab_free(cache, pool[idx]);
+            pool[idx] = slab_alloc(cache);
+        }
+    }
+    double t1 = now_ms();
+
+    printf("  %-12s %7.2f ms (%3.0f ns/roundtrip)\n",
+           label, t1 - t0, (t1 - t0) * 1e6 / ops);
+
+    for (int i = 0; i < pool_size; i++) {
+        if (use_malloc) free(pool[i]);
+        else slab_free(cache, pool[i]);
+    }
+    free(pool);
+}
+
 /* ── Main ─────────────────────────────────────────── */
 
 int main(void)
@@ -246,6 +282,14 @@ int main(void)
         bench_jemalloc_st(BENCH_OPS);
     else
         printf("  jemalloc     (not available)\n");
+
+    printf("\nSteady-state (free+alloc, 1000 live objects, %d rounds):\n", BENCH_OPS);
+    {
+        struct slab_cache *c = slab_cache_create("steady", OBJ_SIZE, 0, 0, NULL, NULL);
+        bench_steady_state(BENCH_OPS, 1000, "slab", c, 0);
+        slab_cache_destroy(c);
+    }
+    bench_steady_state(BENCH_OPS, 1000, "malloc", NULL, 1);
 
     printf("\nMulti-threaded churn (64 alloc + 64 free per round):\n");
     for (int t = 1; t <= MAX_THREADS; t *= 2) {
