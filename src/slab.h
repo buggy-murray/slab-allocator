@@ -1,9 +1,10 @@
 /*
  * slab.h — Userspace slab allocator
  *
- * A simplified slab allocator inspired by the Linux kernel's SLUB allocator.
- * Operates in userspace using mmap for page allocation (replacing the buddy
- * allocator).
+ * A simplified slab allocator inspired by the Linux kernel's SLUB allocator
+ * and Solaris magazine-based caching.
+ *
+ * v0.6: Thread-safe with per-thread magazine caching for lock-free fast path.
  *
  * Author: G.H. Murray
  * Date:   2026-02-16
@@ -15,6 +16,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <pthread.h>
 
 /* Page size — matches typical x86-64/ARM64 */
 #define SLAB_PAGE_SIZE      4096
@@ -34,17 +36,21 @@
 #define SLAB_POISON         0x02   /* Poison free objects to detect use-after-free   */
 #define SLAB_DEBUG          (SLAB_RED_ZONE | SLAB_POISON)
 
+/* Per-thread magazine flags */
+#define SLAB_NO_MAGAZINES   0x04   /* Disable per-thread caching                    */
+
 /* Debug magic values */
 #define SLAB_RED_MAGIC      0xBB   /* Red zone fill byte                            */
 #define SLAB_POISON_FREE    0x6B   /* Free object poison (like Linux's POISON_FREE)  */
 #define SLAB_POISON_ALLOC   0x5A   /* Freshly allocated poison (before ctor)         */
 #define SLAB_RED_ZONE_SIZE  8      /* Bytes of red zone on each side                 */
 
+/* Magazine configuration */
+#define SLAB_MAG_SIZE       32     /* Objects per magazine (power of 2 preferred)    */
+#define SLAB_MAG_BATCH      16     /* Objects to transfer on refill/flush            */
+
 /*
  * struct slab — Represents a single slab (one or more pages)
- *
- * In the Linux kernel, this metadata lives inside struct page.
- * Here we keep a separate header at the start of the slab memory.
  */
 struct slab {
     struct slab      *next;         /* Next slab in partial/full/free list  */
@@ -58,9 +64,22 @@ struct slab {
 };
 
 /*
+ * struct slab_magazine — Per-thread object cache
+ *
+ * Inspired by Solaris magazine layer and NT lookaside lists.
+ * Each thread keeps a small stash of recently freed objects to avoid
+ * hitting the shared slab lock on every alloc/free.
+ */
+struct slab_magazine {
+    void    *objects[SLAB_MAG_SIZE];
+    uint16_t count;                 /* Number of cached objects             */
+};
+
+/*
  * struct slab_cache — Represents a cache for objects of a fixed size
  *
  * Analogous to struct kmem_cache in the Linux kernel.
+ * Thread-safe: shared state protected by mutex, fast path uses magazines.
  */
 struct slab_cache {
     const char       *name;         /* Human-readable name                  */
@@ -71,7 +90,9 @@ struct slab_cache {
     size_t            red_offset;   /* Offset to trailing red zone          */
     size_t            slab_size;    /* Total bytes per slab (pages)         */
     uint16_t          objs_per_slab;/* Objects that fit in one slab         */
-    
+
+    pthread_mutex_t   lock;         /* Protects slab lists and counters     */
+
     struct slab      *partial;      /* Slabs with some free objects         */
     struct slab      *full;         /* Slabs with no free objects           */
     struct slab      *free;         /* Completely empty slabs (cached)      */
@@ -79,10 +100,12 @@ struct slab_cache {
     uint32_t          nr_slabs;     /* Total slabs allocated                */
     uint32_t          nr_partial;   /* Number of partial slabs              */
     uint32_t          nr_free;      /* Number of cached free slabs          */
-    uint32_t          max_free;     /* Max free slabs to cache before release */
+    uint32_t          max_free;     /* Max free slabs to cache              */
 
     void (*ctor)(void *obj);        /* Optional object constructor          */
     void (*dtor)(void *obj);        /* Optional object destructor           */
+
+    pthread_key_t     mag_key;      /* TLS key for per-thread magazine      */
 
     struct slab_cache *next;        /* Global cache list                    */
 };
@@ -93,6 +116,7 @@ struct slab_cache {
  * @name:     Name of the cache (for debugging)
  * @size:     Size of each object in bytes
  * @align:    Alignment requirement (0 for default)
+ * @flags:    SLAB_RED_ZONE, SLAB_POISON, SLAB_NO_MAGAZINES, or 0
  * @ctor:     Optional constructor called on new objects (NULL if none)
  * @dtor:     Optional destructor called before freeing (NULL if none)
  *
@@ -108,29 +132,28 @@ struct slab_cache *slab_cache_create(const char *name, size_t size,
  *
  * All objects must be freed before calling this. If objects are still
  * allocated, this will log a warning and leak rather than corrupt.
+ * NOT thread-safe with concurrent alloc/free — call after joining threads.
  */
 void slab_cache_destroy(struct slab_cache *cache);
 
 /*
- * slab_alloc — Allocate one object from the cache
+ * slab_alloc — Allocate one object from the cache (thread-safe)
  *
- * Returns a pointer to the allocated object, or NULL if allocation fails.
+ * Fast path: pops from per-thread magazine (no lock).
+ * Slow path: locks shared state, refills magazine from slab.
  */
 void *slab_alloc(struct slab_cache *cache);
 
 /*
- * slab_free — Free a previously allocated object back to its cache
+ * slab_free — Free an object back to its cache (thread-safe)
  *
- * @cache:    The cache the object belongs to
- * @obj:      Pointer to the object to free
+ * Fast path: pushes to per-thread magazine (no lock).
+ * Slow path: locks shared state, flushes magazine batch to slab.
  */
 void slab_free(struct slab_cache *cache, void *obj);
 
 /*
  * slab_cache_shrink — Release all cached empty slabs back to the OS
- *
- * Returns the number of slabs released. In the Linux kernel, this is
- * triggered by memory pressure via the shrinker subsystem.
  */
 uint32_t slab_cache_shrink(struct slab_cache *cache);
 

@@ -1,6 +1,6 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -Wpedantic -std=c11 -O2 -g
-LDFLAGS =
+LDFLAGS = -lpthread
 SRCDIR  = src
 BUILD   = build
 
