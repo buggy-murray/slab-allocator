@@ -4,7 +4,8 @@
  * A simplified slab allocator inspired by the Linux kernel's SLUB allocator
  * and Solaris magazine-based caching.
  *
- * v0.6: Thread-safe with per-thread magazine caching for lock-free fast path.
+ * v0.7: Lock-free magazine depot layer using C11 atomics.
+ *        Per-thread magazines swap with depot (CAS) instead of mutex.
  *
  * Author: G.H. Murray
  * Date:   2026-02-16
@@ -17,6 +18,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 /* Page size — matches typical x86-64/ARM64 */
 #define SLAB_PAGE_SIZE      4096
@@ -76,10 +78,34 @@ struct slab_magazine {
 };
 
 /*
+ * struct depot_node — A node in the lock-free depot stack.
+ *
+ * Each node holds a full magazine. Magazines are swapped between
+ * per-thread TLS and the depot using CAS operations.
+ */
+struct depot_node {
+    struct depot_node    *next;
+    struct slab_magazine  mag;
+};
+
+/*
+ * struct depot_head — Tagged pointer for ABA-safe lock-free stack.
+ *
+ * The tag field increments on every CAS to prevent ABA problems.
+ * On 64-bit platforms this struct is 16 bytes, CAS'd atomically
+ * via __int128 (x86-64 CMPXCHG16B) or LDXP/STXP (ARM64).
+ */
+struct depot_head {
+    struct depot_node *node;
+    uintptr_t          tag;
+};
+
+/*
  * struct slab_cache — Represents a cache for objects of a fixed size
  *
  * Analogous to struct kmem_cache in the Linux kernel.
  * Thread-safe: shared state protected by mutex, fast path uses magazines.
+ * v0.7: Lock-free depot between per-thread magazines and shared slab lists.
  */
 struct slab_cache {
     const char       *name;         /* Human-readable name                  */
@@ -106,6 +132,11 @@ struct slab_cache {
     void (*dtor)(void *obj);        /* Optional object destructor           */
 
     pthread_key_t     mag_key;      /* TLS key for per-thread magazine      */
+
+    /* Lock-free depot: stacks of pre-filled/empty magazines (v0.7) */
+    _Atomic struct depot_head depot_full;   /* Full magazines ready to use  */
+    _Atomic struct depot_head depot_empty;  /* Empty magazines to recycle   */
+    _Atomic uint32_t          depot_count;  /* Total depot nodes allocated  */
 
     struct slab_cache *next;        /* Global cache list                    */
 };

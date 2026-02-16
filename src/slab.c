@@ -1,13 +1,20 @@
 /*
  * slab.c — Userspace slab allocator implementation
  *
- * v0.6: Thread-safe with per-thread magazine caching.
+ * v0.7: Lock-free depot layer with C11 atomics.
  *
- * Architecture:
- *   - Shared slab lists protected by per-cache mutex (slow path)
- *   - Per-thread magazines provide lock-free alloc/free (fast path)
- *   - Magazine refill/flush transfers objects in batches
- *   - Thread exit automatically flushes magazines via pthread_key destructor
+ * Architecture (3 layers):
+ *   Layer 1: Per-thread magazine (TLS, no synchronization needed)
+ *   Layer 2: Lock-free depot (CAS-based stack of full/empty magazines)
+ *   Layer 3: Shared slab lists protected by per-cache mutex
+ *
+ * Alloc fast path:  pop from magazine (no sync)
+ * Alloc medium path: swap empty magazine for full one from depot (CAS)
+ * Alloc slow path:  fill magazine from slab lists (mutex)
+ *
+ * Free fast path:   push to magazine (no sync)
+ * Free medium path: swap full magazine for empty one from depot (CAS)
+ * Free slow path:   drain magazine to slab lists (mutex)
  *
  * Author: G.H. Murray
  * Date:   2026-02-16
@@ -334,19 +341,115 @@ static void slab_free_slow(struct slab_cache *cache, void *obj)
 }
 
 /* ──────────────────────────────────────────────────────────────────
+ * Lock-free depot layer (v0.7)
+ *
+ * Two stacks per cache: depot_full (magazines with objects) and
+ * depot_empty (empty magazines for reuse). Both use CAS with ABA
+ * counter to prevent corruption under concurrent access.
+ * ────────────────────────────────────────────────────────────────── */
+
+static struct depot_node *depot_pop(_Atomic struct depot_head *head)
+{
+    struct depot_head old_head, new_head;
+
+    old_head = atomic_load_explicit(head, memory_order_acquire);
+    do {
+        if (!old_head.node)
+            return NULL;
+        new_head.node = old_head.node->next;
+        new_head.tag  = old_head.tag + 1;
+    } while (!atomic_compare_exchange_weak_explicit(
+                head, &old_head, new_head,
+                memory_order_acq_rel, memory_order_acquire));
+
+    old_head.node->next = NULL;
+    return old_head.node;
+}
+
+static void depot_push(_Atomic struct depot_head *head, struct depot_node *node)
+{
+    struct depot_head old_head, new_head;
+
+    old_head = atomic_load_explicit(head, memory_order_relaxed);
+    do {
+        node->next    = old_head.node;
+        new_head.node = node;
+        new_head.tag  = old_head.tag + 1;
+    } while (!atomic_compare_exchange_weak_explicit(
+                head, &old_head, new_head,
+                memory_order_release, memory_order_relaxed));
+}
+
+/*
+ * Allocate a new depot node (malloc, so not lock-free itself,
+ * but only called on the slow path during depot replenishment).
+ */
+static struct depot_node *depot_node_alloc(void)
+{
+    struct depot_node *n = calloc(1, sizeof(struct depot_node));
+    return n;
+}
+
+/*
+ * Fill a depot node's magazine from the shared slab (under mutex).
+ * Returns number of objects placed in the magazine.
+ */
+static uint16_t depot_fill_magazine(struct slab_cache *cache, struct depot_node *node)
+{
+    struct slab_magazine *mag = &node->mag;
+    mag->count = 0;
+
+    pthread_mutex_lock(&cache->lock);
+    for (uint16_t i = 0; i < SLAB_MAG_SIZE; i++) {
+        void *obj = slab_alloc_slow(cache);
+        if (!obj)
+            break;
+
+        if (cache->flags & SLAB_POISON) {
+            unsigned char *check = (unsigned char *)obj_to_user(cache, obj);
+            size_t skip = (cache->flags & SLAB_RED_ZONE) ? 0 : sizeof(void *);
+            if (cache->raw_size > skip && check[skip] == SLAB_POISON_FREE)
+                poison_check_free(cache, obj);
+        }
+        red_zone_fill(cache, obj);
+
+        void *user = obj_to_user(cache, obj);
+        if (cache->ctor)
+            cache->ctor(user);
+
+        mag->objects[mag->count++] = user;
+    }
+    pthread_mutex_unlock(&cache->lock);
+    return mag->count;
+}
+
+/*
+ * Drain a depot node's magazine back to shared slab (under mutex).
+ */
+static void depot_drain_magazine(struct slab_cache *cache, struct depot_node *node)
+{
+    struct slab_magazine *mag = &node->mag;
+
+    pthread_mutex_lock(&cache->lock);
+    for (uint16_t i = 0; i < mag->count; i++) {
+        void *user = mag->objects[i];
+        void *obj  = user_to_obj(cache, user);
+        red_zone_check(cache, obj);
+        poison_free(cache, obj);
+        slab_free_slow(cache, obj);
+    }
+    pthread_mutex_unlock(&cache->lock);
+    mag->count = 0;
+}
+
+/* ──────────────────────────────────────────────────────────────────
  * Per-thread magazine layer
  * ────────────────────────────────────────────────────────────────── */
 
 /*
  * Magazine destructor — called on thread exit.
- * Flushes all cached objects back to shared slab.
- *
- * IMPORTANT: We need the cache pointer to flush, but pthread_key destructor
- * only gets the magazine pointer. Solution: store cache backpointer in magazine.
- * Actually, simpler: we'll iterate global_cache_list since we know the key.
- *
- * Better solution: embed cache pointer at the end of the magazine struct.
- * But to keep it simple, we'll use a wrapper struct.
+ * Flushes all cached objects back to shared slab, then returns
+ * the magazine to the depot's empty stack for reuse.
  */
 struct mag_wrapper {
     struct slab_magazine  mag;
@@ -392,70 +495,115 @@ static struct slab_magazine *mag_get_or_create_wrapped(struct slab_cache *cache)
 }
 
 /*
- * Refill magazine from shared slab.
- * Caller must NOT hold cache->lock.
- * Returns number of objects transferred.
+ * Refill magazine — try depot first (lock-free), then slab (mutex).
+ *
+ * Strategy:
+ *  1. Try to pop a full magazine from the depot (CAS — fast)
+ *  2. If depot empty, fill a new magazine from slab lists (mutex — slow)
+ *
+ * Returns number of objects available in magazine after refill.
  */
 static uint16_t mag_refill(struct slab_cache *cache, struct slab_magazine *mag)
 {
-    uint16_t batch = SLAB_MAG_BATCH;
-    uint16_t space = SLAB_MAG_SIZE - mag->count;
-    if (batch > space)
-        batch = space;
+    /* Medium path: try depot */
+    struct depot_node *full = depot_pop(&cache->depot_full);
+    if (full) {
+        /* Swap: copy full depot magazine into thread magazine */
+        memcpy(mag->objects, full->mag.objects,
+               full->mag.count * sizeof(void *));
+        mag->count = full->mag.count;
 
-    pthread_mutex_lock(&cache->lock);
-
-    uint16_t got = 0;
-    for (uint16_t i = 0; i < batch; i++) {
-        void *obj = slab_alloc_slow(cache);
-        if (!obj)
-            break;
-
-        /* Debug processing */
-        if (cache->flags & SLAB_POISON) {
-            unsigned char *check = (unsigned char *)obj_to_user(cache, obj);
-            size_t skip = (cache->flags & SLAB_RED_ZONE) ? 0 : sizeof(void *);
-            if (cache->raw_size > skip && check[skip] == SLAB_POISON_FREE)
-                poison_check_free(cache, obj);
-        }
-        red_zone_fill(cache, obj);
-
-        void *user = obj_to_user(cache, obj);
-        if (cache->ctor)
-            cache->ctor(user);
-
-        mag->objects[mag->count++] = user;
-        got++;
+        /* Return the now-empty depot node to empty stack */
+        full->mag.count = 0;
+        depot_push(&cache->depot_empty, full);
+        return mag->count;
     }
 
-    pthread_mutex_unlock(&cache->lock);
-    return got;
+    /* Slow path: get or create a depot node, fill from slab */
+    struct depot_node *node = depot_pop(&cache->depot_empty);
+    if (!node) {
+        node = depot_node_alloc();
+        if (!node) {
+            /* Absolute fallback: fill magazine directly (old v0.6 path) */
+            uint16_t batch = SLAB_MAG_BATCH;
+            uint16_t space = SLAB_MAG_SIZE - mag->count;
+            if (batch > space) batch = space;
+
+            pthread_mutex_lock(&cache->lock);
+            uint16_t got = 0;
+            for (uint16_t i = 0; i < batch; i++) {
+                void *obj = slab_alloc_slow(cache);
+                if (!obj) break;
+                if (cache->flags & SLAB_POISON) {
+                    unsigned char *check = (unsigned char *)obj_to_user(cache, obj);
+                    size_t skip = (cache->flags & SLAB_RED_ZONE) ? 0 : sizeof(void *);
+                    if (cache->raw_size > skip && check[skip] == SLAB_POISON_FREE)
+                        poison_check_free(cache, obj);
+                }
+                red_zone_fill(cache, obj);
+                void *user = obj_to_user(cache, obj);
+                if (cache->ctor) cache->ctor(user);
+                mag->objects[mag->count++] = user;
+                got++;
+            }
+            pthread_mutex_unlock(&cache->lock);
+            return got;
+        }
+        atomic_fetch_add_explicit(&cache->depot_count, 1, memory_order_relaxed);
+    }
+
+    /* Fill the depot node from slab, then transfer to thread magazine */
+    uint16_t filled = depot_fill_magazine(cache, node);
+    if (filled == 0) {
+        depot_push(&cache->depot_empty, node);
+        return 0;
+    }
+
+    memcpy(mag->objects, node->mag.objects, filled * sizeof(void *));
+    mag->count = filled;
+
+    node->mag.count = 0;
+    depot_push(&cache->depot_empty, node);
+    return mag->count;
 }
 
 /*
- * Flush half the magazine back to shared slab.
- * Caller must NOT hold cache->lock.
+ * Flush magazine — try depot first (lock-free), then slab (mutex).
+ *
+ * Strategy:
+ *  1. Move thread magazine contents into a depot node → push to depot_full (CAS)
+ *  2. If no empty depot nodes, drain to slab lists directly (mutex — slow)
  */
 static void mag_flush(struct slab_cache *cache, struct slab_magazine *mag)
 {
+    /* Medium path: get an empty depot node, fill it, push to full depot */
+    struct depot_node *node = depot_pop(&cache->depot_empty);
+    if (!node)
+        node = depot_node_alloc();
+
+    if (node) {
+        /* Transfer all objects from thread magazine to depot node */
+        memcpy(node->mag.objects, mag->objects, mag->count * sizeof(void *));
+        node->mag.count = mag->count;
+        mag->count = 0;
+
+        depot_push(&cache->depot_full, node);
+        return;
+    }
+
+    /* Fallback: drain half to slab directly (old v0.6 behavior) */
     uint16_t flush = mag->count / 2;
-    if (flush < 1)
-        flush = 1;
+    if (flush < 1) flush = 1;
 
     pthread_mutex_lock(&cache->lock);
-
     for (uint16_t i = 0; i < flush; i++) {
         mag->count--;
         void *user = mag->objects[mag->count];
         void *obj = user_to_obj(cache, user);
-
-        /* Debug: check red zones, then poison */
         red_zone_check(cache, obj);
         poison_free(cache, obj);
-
         slab_free_slow(cache, obj);
     }
-
     pthread_mutex_unlock(&cache->lock);
 }
 
@@ -500,6 +648,12 @@ struct slab_cache *slab_cache_create(const char *name, size_t size,
     /* Initialize mutex */
     pthread_mutex_init(&cache->lock, NULL);
 
+    /* Initialize lock-free depot (v0.7) */
+    struct depot_head empty_depot = { .node = NULL, .tag = 0 };
+    atomic_store(&cache->depot_full, empty_depot);
+    atomic_store(&cache->depot_empty, empty_depot);
+    atomic_store(&cache->depot_count, 0);
+
     /* Initialize TLS key for per-thread magazines */
     if (!(flags & SLAB_NO_MAGAZINES)) {
         if (pthread_key_create(&cache->mag_key, mag_destructor) != 0) {
@@ -539,6 +693,18 @@ void slab_cache_destroy(struct slab_cache *cache)
             pthread_mutex_unlock(&cache->lock);
             mag->count = 0;
             free(w);
+        }
+    }
+
+    /* Drain depot BEFORE releasing slabs (v0.7) — objects go back to slabs */
+    {
+        struct depot_node *node;
+        while ((node = depot_pop(&cache->depot_full)) != NULL) {
+            depot_drain_magazine(cache, node);
+            free(node);
+        }
+        while ((node = depot_pop(&cache->depot_empty)) != NULL) {
+            free(node);
         }
     }
 

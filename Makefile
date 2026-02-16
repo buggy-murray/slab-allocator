@@ -1,6 +1,6 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -Wpedantic -std=c11 -O2 -g
-LDFLAGS = -lpthread
+LDFLAGS = -lpthread -latomic
 SRCDIR  = src
 BUILD   = build
 
@@ -19,7 +19,7 @@ $(BUILD)/%.o: $(SRCDIR)/%.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 run: $(TARGET)
 	./$(TARGET)
