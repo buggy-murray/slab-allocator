@@ -62,6 +62,9 @@ static size_t compute_slab_size(size_t obj_size, uint16_t *out_count)
 
 static void *pages_alloc_aligned(size_t slab_size, void **out_raw, size_t *out_raw_size)
 {
+    /* Guard against overflow: slab_size + (slab_size - 1) must not wrap */
+    if (slab_size == 0 || slab_size > SIZE_MAX / 2)
+        return NULL;
     size_t raw_size = slab_size + (slab_size - 1);
     void *raw = mmap(NULL, raw_size, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -520,18 +523,22 @@ void slab_cache_destroy(struct slab_cache *cache)
     if (!cache)
         return;
 
-    /* Flush the calling thread's magazine before destroying */
+    /* Flush the calling thread's magazine before destroying.
+     * Must hold cache->lock since slab_free_slow expects it.
+     * Clear TLS key first to prevent mag_destructor double-free. */
     if (!(cache->flags & SLAB_NO_MAGAZINES)) {
         struct mag_wrapper *w = (struct mag_wrapper *)pthread_getspecific(cache->mag_key);
         if (w) {
+            pthread_setspecific(cache->mag_key, NULL);
             struct slab_magazine *mag = &w->mag;
+            pthread_mutex_lock(&cache->lock);
             for (uint16_t i = 0; i < mag->count; i++) {
                 void *obj = user_to_obj(cache, mag->objects[i]);
                 slab_free_slow(cache, obj);
             }
+            pthread_mutex_unlock(&cache->lock);
             mag->count = 0;
             free(w);
-            pthread_setspecific(cache->mag_key, NULL);
         }
     }
 
@@ -718,8 +725,12 @@ void slab_system_init(void)
 
 void slab_system_fini(void)
 {
+    /* Take ownership of the entire cache list atomically.
+     * slab_cache_destroy removes each cache from global_cache_list
+     * under global_lock, so we just snapshot the head here. */
     pthread_mutex_lock(&global_lock);
     struct slab_cache *c = global_cache_list;
+    global_cache_list = NULL;  /* Prevent new caches from seeing stale list */
     pthread_mutex_unlock(&global_lock);
 
     while (c) {
@@ -728,8 +739,4 @@ void slab_system_fini(void)
         slab_cache_destroy(c);
         c = next;
     }
-
-    pthread_mutex_lock(&global_lock);
-    global_cache_list = NULL;
-    pthread_mutex_unlock(&global_lock);
 }
