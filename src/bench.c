@@ -18,13 +18,34 @@
 #include <pthread.h>
 
 /*
- * jemalloc — linked via -ljemalloc. Uses mallocx/sdallocx (always available
- * regardless of je_ prefix configuration).
+ * jemalloc — loaded dynamically via dlopen/dlsym.
+ * Debian's jemalloc overrides standard malloc/free (no je_ prefix),
+ * so we must dlopen the .so and use function pointers to get separate symbols.
  */
-#include <jemalloc/jemalloc.h>
+#include <dlfcn.h>
 
-static int je_available = 1;
-static void je_init(void) { /* always available when linked */ }
+static int je_available = 0;
+static void *(*je_malloc_fn)(size_t) = NULL;
+static void  (*je_free_fn)(void *) = NULL;
+
+static void je_init(void)
+{
+    void *h = dlopen("libjemalloc.so.2", RTLD_NOW | RTLD_LOCAL);
+    if (!h) {
+        fprintf(stderr, "bench: jemalloc not found, skipping (%s)\n", dlerror());
+        return;
+    }
+    /* Debian's jemalloc exports standard names */
+    je_malloc_fn = dlsym(h, "malloc");
+    je_free_fn   = dlsym(h, "free");
+    if (je_malloc_fn && je_free_fn) {
+        je_available = 1;
+        fprintf(stderr, "bench: jemalloc loaded via dlopen\n");
+    } else {
+        fprintf(stderr, "bench: jemalloc symbols not found\n");
+    }
+    /* intentionally not dlclose — keep symbols alive */
+}
 
 #define OBJ_SIZE    64
 #define WARMUP_OPS  10000
@@ -135,18 +156,18 @@ static void bench_jemalloc_st(int ops)
     void **ptrs = malloc(ops * sizeof(void *));
 
     for (int i = 0; i < WARMUP_OPS && i < ops; i++) {
-        ptrs[i] = mallocx(OBJ_SIZE, 0); }
+        ptrs[i] = je_malloc_fn(OBJ_SIZE); }
     for (int i = 0; i < WARMUP_OPS && i < ops; i++) {
-        sdallocx(ptrs[i], OBJ_SIZE, 0); }
+        je_free_fn(ptrs[i]); }
 
     double t0 = now_ms();
     for (int i = 0; i < ops; i++)
-        ptrs[i] = mallocx(OBJ_SIZE, 0);
+        ptrs[i] = je_malloc_fn(OBJ_SIZE);
     double t1 = now_ms();
 
     double t2 = now_ms();
     for (int i = 0; i < ops; i++)
-        sdallocx(ptrs[i], OBJ_SIZE, 0);
+        je_free_fn(ptrs[i]);
     double t3 = now_ms();
 
     printf("  jemalloc     alloc: %7.2f ms (%3.0f ns/op)  free: %7.2f ms (%3.0f ns/op)\n",
@@ -178,7 +199,7 @@ static void *mt_churn_worker(void *arg)
             if (a->use_malloc == 1)
                 ptrs[i] = malloc(OBJ_SIZE);
             else if (a->use_malloc == 2)
-                ptrs[i] = mallocx(OBJ_SIZE, 0);
+                ptrs[i] = je_malloc_fn(OBJ_SIZE);
             else
                 ptrs[i] = slab_alloc(a->cache);
         }
@@ -187,7 +208,7 @@ static void *mt_churn_worker(void *arg)
             if (a->use_malloc == 1)
                 free(ptrs[i]);
             else if (a->use_malloc == 2)
-                sdallocx(ptrs[i], OBJ_SIZE, 0);
+                je_free_fn(ptrs[i]);
             else
                 slab_free(a->cache, ptrs[i]);
         }

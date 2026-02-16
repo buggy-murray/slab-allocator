@@ -6,6 +6,8 @@
  *
  * v0.7: Lock-free magazine depot layer using C11 atomics.
  *        Per-thread magazines swap with depot (CAS) instead of mutex.
+ * v0.8: Per-CPU depot partitioning to eliminate cross-CPU CAS contention.
+ *        Each CPU gets its own lock-free depot stacks (full/empty).
  *
  * Author: G.H. Murray
  * Date:   2026-02-16
@@ -50,6 +52,9 @@
 /* Magazine configuration */
 #define SLAB_MAG_SIZE       32     /* Objects per magazine (power of 2 preferred)    */
 #define SLAB_MAG_BATCH      16     /* Objects to transfer on refill/flush            */
+
+/* Per-CPU depot configuration (v0.8) */
+#define SLAB_MAX_CPUS       256    /* Hard cap on CPU depot array size               */
 
 /*
  * struct slab — Represents a single slab (one or more pages)
@@ -101,6 +106,20 @@ struct depot_head {
 };
 
 /*
+ * struct cpu_depot — Per-CPU lock-free depot (v0.8)
+ *
+ * Each CPU gets its own pair of lock-free stacks (full/empty magazines)
+ * to eliminate cross-CPU CAS contention on the depot layer.
+ * Padded to 128 bytes to prevent false sharing between CPU depot slots.
+ */
+struct cpu_depot {
+    _Atomic struct depot_head full;     /* Full magazines ready to use      */
+    _Atomic struct depot_head empty;    /* Empty magazines for recycling    */
+    _Atomic uint32_t          count;    /* Depot nodes in this CPU's depot  */
+    char _pad[128 - 2 * sizeof(struct depot_head) - sizeof(_Atomic uint32_t)];
+};
+
+/*
  * struct slab_cache — Represents a cache for objects of a fixed size
  *
  * Analogous to struct kmem_cache in the Linux kernel.
@@ -133,10 +152,9 @@ struct slab_cache {
 
     pthread_key_t     mag_key;      /* TLS key for per-thread magazine      */
 
-    /* Lock-free depot: stacks of pre-filled/empty magazines (v0.7) */
-    _Atomic struct depot_head depot_full;   /* Full magazines ready to use  */
-    _Atomic struct depot_head depot_empty;  /* Empty magazines to recycle   */
-    _Atomic uint32_t          depot_count;  /* Total depot nodes allocated  */
+    /* Per-CPU lock-free depots (v0.8) */
+    struct cpu_depot  *cpu_depots;  /* Array[nr_cpus] of per-CPU depots    */
+    uint32_t           nr_cpus;     /* Number of CPU depot slots           */
 
     struct slab_cache *next;        /* Global cache list                    */
 };

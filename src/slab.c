@@ -1,11 +1,11 @@
 /*
  * slab.c — Userspace slab allocator implementation
  *
- * v0.7: Lock-free depot layer with C11 atomics.
+ * v0.8: Per-CPU depot partitioning with lock-free C11 atomics.
  *
  * Architecture (3 layers):
  *   Layer 1: Per-thread magazine (TLS, no synchronization needed)
- *   Layer 2: Lock-free depot (CAS-based stack of full/empty magazines)
+ *   Layer 2: Per-CPU lock-free depot (CAS-based stack of full/empty magazines)
  *   Layer 3: Shared slab lists protected by per-cache mutex
  *
  * Alloc fast path:  pop from magazine (no sync)
@@ -27,6 +27,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sched.h>
+#include <unistd.h>
 #include <assert.h>
 
 /* ──────────────────────────────────────────────────────────────────
@@ -341,12 +343,26 @@ static void slab_free_slow(struct slab_cache *cache, void *obj)
 }
 
 /* ──────────────────────────────────────────────────────────────────
- * Lock-free depot layer (v0.7)
+ * Per-CPU lock-free depot layer (v0.8)
  *
- * Two stacks per cache: depot_full (magazines with objects) and
- * depot_empty (empty magazines for reuse). Both use CAS with ABA
- * counter to prevent corruption under concurrent access.
+ * Each CPU has its own depot (full/empty stacks) to eliminate
+ * cross-CPU CAS contention. CPU ID obtained via sched_getcpu()
+ * (VDSO, ~2ns on Linux). Fallback to CPU 0 if unavailable.
  * ────────────────────────────────────────────────────────────────── */
+
+/*
+ * get_cpu_depot — Get the depot for the current CPU.
+ *
+ * Uses sched_getcpu() for O(1) CPU identification (Linux VDSO).
+ * Falls back to CPU 0 if sched_getcpu() fails or returns out-of-range.
+ */
+static inline struct cpu_depot *get_cpu_depot(struct slab_cache *cache)
+{
+    int cpu = sched_getcpu();
+    if (cpu < 0 || (unsigned)cpu >= cache->nr_cpus)
+        cpu = 0;
+    return &cache->cpu_depots[cpu];
+}
 
 static struct depot_node *depot_pop(_Atomic struct depot_head *head)
 {
@@ -505,8 +521,10 @@ static struct slab_magazine *mag_get_or_create_wrapped(struct slab_cache *cache)
  */
 static uint16_t mag_refill(struct slab_cache *cache, struct slab_magazine *mag)
 {
-    /* Medium path: try depot */
-    struct depot_node *full = depot_pop(&cache->depot_full);
+    struct cpu_depot *depot = get_cpu_depot(cache);
+
+    /* Medium path: try per-CPU depot */
+    struct depot_node *full = depot_pop(&depot->full);
     if (full) {
         /* Swap: copy full depot magazine into thread magazine */
         memcpy(mag->objects, full->mag.objects,
@@ -515,12 +533,12 @@ static uint16_t mag_refill(struct slab_cache *cache, struct slab_magazine *mag)
 
         /* Return the now-empty depot node to empty stack */
         full->mag.count = 0;
-        depot_push(&cache->depot_empty, full);
+        depot_push(&depot->empty, full);
         return mag->count;
     }
 
     /* Slow path: get or create a depot node, fill from slab */
-    struct depot_node *node = depot_pop(&cache->depot_empty);
+    struct depot_node *node = depot_pop(&depot->empty);
     if (!node) {
         node = depot_node_alloc();
         if (!node) {
@@ -549,13 +567,13 @@ static uint16_t mag_refill(struct slab_cache *cache, struct slab_magazine *mag)
             pthread_mutex_unlock(&cache->lock);
             return got;
         }
-        atomic_fetch_add_explicit(&cache->depot_count, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&depot->count, 1, memory_order_relaxed);
     }
 
     /* Fill the depot node from slab, then transfer to thread magazine */
     uint16_t filled = depot_fill_magazine(cache, node);
     if (filled == 0) {
-        depot_push(&cache->depot_empty, node);
+        depot_push(&depot->empty, node);
         return 0;
     }
 
@@ -563,7 +581,7 @@ static uint16_t mag_refill(struct slab_cache *cache, struct slab_magazine *mag)
     mag->count = filled;
 
     node->mag.count = 0;
-    depot_push(&cache->depot_empty, node);
+    depot_push(&depot->empty, node);
     return mag->count;
 }
 
@@ -576,8 +594,10 @@ static uint16_t mag_refill(struct slab_cache *cache, struct slab_magazine *mag)
  */
 static void mag_flush(struct slab_cache *cache, struct slab_magazine *mag)
 {
+    struct cpu_depot *depot = get_cpu_depot(cache);
+
     /* Medium path: get an empty depot node, fill it, push to full depot */
-    struct depot_node *node = depot_pop(&cache->depot_empty);
+    struct depot_node *node = depot_pop(&depot->empty);
     if (!node)
         node = depot_node_alloc();
 
@@ -587,7 +607,7 @@ static void mag_flush(struct slab_cache *cache, struct slab_magazine *mag)
         node->mag.count = mag->count;
         mag->count = 0;
 
-        depot_push(&cache->depot_full, node);
+        depot_push(&depot->full, node);
         return;
     }
 
@@ -648,11 +668,25 @@ struct slab_cache *slab_cache_create(const char *name, size_t size,
     /* Initialize mutex */
     pthread_mutex_init(&cache->lock, NULL);
 
-    /* Initialize lock-free depot (v0.7) */
-    struct depot_head empty_depot = { .node = NULL, .tag = 0 };
-    atomic_store(&cache->depot_full, empty_depot);
-    atomic_store(&cache->depot_empty, empty_depot);
-    atomic_store(&cache->depot_count, 0);
+    /* Initialize per-CPU depots (v0.8) */
+    {
+        long ncpus = sysconf(_SC_NPROCESSORS_CONF);
+        if (ncpus < 1) ncpus = 1;
+        if (ncpus > SLAB_MAX_CPUS) ncpus = SLAB_MAX_CPUS;
+        cache->nr_cpus = (uint32_t)ncpus;
+        cache->cpu_depots = calloc((size_t)ncpus, sizeof(struct cpu_depot));
+        if (!cache->cpu_depots) {
+            pthread_mutex_destroy(&cache->lock);
+            free(cache);
+            return NULL;
+        }
+        struct depot_head empty_depot = { .node = NULL, .tag = 0 };
+        for (uint32_t i = 0; i < cache->nr_cpus; i++) {
+            atomic_store(&cache->cpu_depots[i].full, empty_depot);
+            atomic_store(&cache->cpu_depots[i].empty, empty_depot);
+            atomic_store(&cache->cpu_depots[i].count, 0);
+        }
+    }
 
     /* Initialize TLS key for per-thread magazines */
     if (!(flags & SLAB_NO_MAGAZINES)) {
@@ -696,17 +730,18 @@ void slab_cache_destroy(struct slab_cache *cache)
         }
     }
 
-    /* Drain depot BEFORE releasing slabs (v0.7) — objects go back to slabs */
-    {
+    /* Drain all per-CPU depots BEFORE releasing slabs (v0.8) */
+    for (uint32_t cpu = 0; cpu < cache->nr_cpus; cpu++) {
         struct depot_node *node;
-        while ((node = depot_pop(&cache->depot_full)) != NULL) {
+        while ((node = depot_pop(&cache->cpu_depots[cpu].full)) != NULL) {
             depot_drain_magazine(cache, node);
             free(node);
         }
-        while ((node = depot_pop(&cache->depot_empty)) != NULL) {
+        while ((node = depot_pop(&cache->cpu_depots[cpu].empty)) != NULL) {
             free(node);
         }
     }
+    free(cache->cpu_depots);
 
     struct slab *s, *next;
 
