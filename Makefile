@@ -10,10 +10,11 @@ TARGET  = $(BUILD)/slab_test
 
 VMEM_TARGET = $(BUILD)/vmem_test
 TAG_TARGET  = $(BUILD)/tag_test
+BENCH_TARGET = $(BUILD)/bench
 
 .PHONY: all clean run test
 
-all: $(TARGET) $(VMEM_TARGET) $(TAG_TARGET)
+all: $(TARGET) $(VMEM_TARGET) $(TAG_TARGET) $(BENCH_TARGET)
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -29,6 +30,9 @@ $(VMEM_TARGET): $(BUILD)/vmem.o $(BUILD)/vmem_test.o
 
 $(TAG_TARGET): $(BUILD)/slab.o $(BUILD)/vmem.o $(BUILD)/slab_tags.o $(BUILD)/test_tags.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(BENCH_TARGET): $(BUILD)/slab.o $(BUILD)/vmem.o $(BUILD)/bench.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) -ldl
 
 run: $(TARGET)
 	./$(TARGET)

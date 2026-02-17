@@ -322,5 +322,42 @@ int main(void)
         printf("\n");
     }
 
+    /* Quarantine overhead benchmark */
+    printf("Quarantine overhead (alloc+free, %d ops):\n", BENCH_OPS);
+    {
+        struct slab_cache *c_normal = slab_cache_create("qbench-normal",
+            OBJ_SIZE, 0, 0, NULL, NULL);
+        struct slab_cache *c_quar = slab_cache_create("qbench-quarantine",
+            OBJ_SIZE, 0, SLAB_QUARANTINE | SLAB_POISON, NULL, NULL);
+
+        struct timespec t0, t1;
+
+        /* Normal path */
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int i = 0; i < BENCH_OPS; i++) {
+            void *p = slab_alloc(c_normal);
+            slab_free(c_normal, p);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double ns_normal = (double)(t1.tv_sec - t0.tv_sec) * 1e9
+                         + (double)(t1.tv_nsec - t0.tv_nsec);
+        printf("  slab (normal)     %6.1f ns/op\n", ns_normal / BENCH_OPS);
+
+        /* Quarantine path */
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int i = 0; i < BENCH_OPS; i++) {
+            void *p = slab_alloc(c_quar);
+            slab_free(c_quar, p);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double ns_quar = (double)(t1.tv_sec - t0.tv_sec) * 1e9
+                        + (double)(t1.tv_nsec - t0.tv_nsec);
+        printf("  slab (quarantine) %6.1f ns/op\n", ns_quar / BENCH_OPS);
+        printf("  overhead: %.1f%%\n", ((ns_quar - ns_normal) / ns_normal) * 100.0);
+
+        slab_cache_destroy(c_normal);
+        slab_cache_destroy(c_quar);
+    }
+
     return 0;
 }
