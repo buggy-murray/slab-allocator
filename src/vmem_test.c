@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <string.h>
+#include <pthread.h>
+#include <time.h>
 
 static void test_basic(void)
 {
@@ -196,6 +198,78 @@ static void test_best_fit(void)
     printf("  PASSED\n\n");
 }
 
+/* ── Multi-threaded stress test ── */
+
+#define MT_THREADS    8
+#define MT_OPS        10000
+#define MT_ALLOC_SIZE 64
+
+struct mt_args {
+    vmem_t *vm;
+    int thread_id;
+    int success_count;
+};
+
+static void *mt_worker(void *arg)
+{
+    struct mt_args *a = (struct mt_args *)arg;
+    int ok = 0;
+
+    for (int i = 0; i < MT_OPS; i++) {
+        uintptr_t addr;
+        if (vmem_alloc(a->vm, MT_ALLOC_SIZE, &addr) == 0) {
+            ok++;
+            vmem_free(a->vm, addr, MT_ALLOC_SIZE);
+        }
+    }
+
+    a->success_count = ok;
+    return NULL;
+}
+
+static void test_multithreaded(void)
+{
+    printf("=== test_multithreaded ===\n");
+
+    /* Large arena to avoid exhaustion: 8 threads * 10000 * 64 bytes active at once
+     * is worst case ~5MB, but we free immediately so actual pressure is low */
+    vmem_t *vm = vmem_create("mt_test", 0, 16 * 1024 * 1024, MT_ALLOC_SIZE);
+    assert(vm != NULL);
+
+    pthread_t threads[MT_THREADS];
+    struct mt_args args[MT_THREADS];
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (int i = 0; i < MT_THREADS; i++) {
+        args[i].vm = vm;
+        args[i].thread_id = i;
+        args[i].success_count = 0;
+        pthread_create(&threads[i], NULL, mt_worker, &args[i]);
+    }
+
+    int total_ok = 0;
+    for (int i = 0; i < MT_THREADS; i++) {
+        pthread_join(threads[i], NULL);
+        total_ok += args[i].success_count;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double ms = (end.tv_sec - start.tv_sec) * 1000.0 +
+                (end.tv_nsec - start.tv_nsec) / 1e6;
+
+    int total_ops = MT_THREADS * MT_OPS * 2;  /* alloc + free */
+    printf("  %d threads × %d rounds = %d total ops in %.2f ms\n",
+           MT_THREADS, MT_OPS, total_ops, ms);
+    printf("  %d/%d allocs succeeded\n", total_ok, MT_THREADS * MT_OPS);
+    assert(total_ok == MT_THREADS * MT_OPS);
+
+    vmem_stats(vm);
+    vmem_destroy(vm);
+    printf("  PASSED\n\n");
+}
+
 int main(void)
 {
     printf("Vmem Arena Allocator Test Suite\n");
@@ -207,6 +281,7 @@ int main(void)
     test_add_span();
     test_xalloc_align();
     test_best_fit();
+    test_multithreaded();
 
     printf("All vmem tests passed.\n");
     return 0;
