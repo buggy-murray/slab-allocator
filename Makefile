@@ -9,10 +9,11 @@ OBJS    = $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(SRCS))
 TARGET  = $(BUILD)/slab_test
 
 VMEM_TARGET = $(BUILD)/vmem_test
+TAG_TARGET  = $(BUILD)/tag_test
 
 .PHONY: all clean run test
 
-all: $(TARGET) $(VMEM_TARGET)
+all: $(TARGET) $(VMEM_TARGET) $(TAG_TARGET)
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -26,12 +27,16 @@ $(TARGET): $(OBJS)
 $(VMEM_TARGET): $(BUILD)/vmem.o $(BUILD)/vmem_test.o
 	$(CC) $(CFLAGS) $^ -o $@ -lpthread
 
+$(TAG_TARGET): $(BUILD)/slab.o $(BUILD)/vmem.o $(BUILD)/slab_tags.o $(BUILD)/test_tags.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
 run: $(TARGET)
 	./$(TARGET)
 
-test: $(TARGET) $(VMEM_TARGET)
+test: $(TARGET) $(VMEM_TARGET) $(TAG_TARGET)
 	./$(TARGET)
 	./$(VMEM_TARGET)
+	./$(TAG_TARGET)
 
 clean:
 	rm -rf $(BUILD)
