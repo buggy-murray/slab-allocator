@@ -29,6 +29,19 @@
 /* Forward declaration for vmem integration */
 struct vmem;
 
+/*
+ * Pool tags (v1.2) — NT-inspired allocation tracking
+ *
+ * 4-character tag packed into uint32_t, identical to NT's POOL_TAG.
+ * Used with slab_alloc_tag() / slab_free_tag() for per-tag accounting.
+ */
+typedef uint32_t POOL_TAG;
+
+#define MAKE_POOL_TAG(a, b, c, d)  \
+    ((POOL_TAG)((a) | ((b) << 8) | ((c) << 16) | ((d) << 24)))
+
+#define POOL_TAG_NONE  MAKE_POOL_TAG('N','o','n','e')
+
 /* Page size — matches typical x86-64/ARM64 */
 #define SLAB_PAGE_SIZE      4096
 #define SLAB_PAGE_SHIFT     12
@@ -52,6 +65,9 @@ struct vmem;
 
 /* Quarantine (v1.3) — deferred reuse for use-after-free detection */
 #define SLAB_QUARANTINE     0x08   /* Enable quarantine for freed objects            */
+
+/* Pool tag tracking (v1.2) */
+#define SLAB_POOL_TAGS      0x10   /* Enable per-object pool tag tracking            */
 
 /* Debug magic values */
 #define SLAB_RED_MAGIC      0xBB   /* Red zone fill byte                            */
@@ -277,5 +293,62 @@ void slab_system_fini(void);
 
 void *slab_kmalloc(size_t size);
 void  slab_kfree(void *ptr, size_t size);
+
+/*
+ * Pool tag tracking (v1.2) — NT-inspired allocation accounting
+ *
+ * When a cache is created with SLAB_POOL_TAGS, every allocation can be
+ * tagged with a 4-character identifier. A global hash table tracks per-tag
+ * statistics: active allocations, total allocs/frees, peak usage.
+ *
+ * Inspired by NT's ExAllocatePoolWithTag and the PoolMon diagnostic tool.
+ */
+
+/* Per-tag statistics entry */
+struct pool_tag_entry {
+    POOL_TAG             tag;          /* 4-char tag identifier            */
+    _Atomic uint64_t     allocs;       /* Total allocations with this tag  */
+    _Atomic uint64_t     frees;        /* Total frees with this tag        */
+    _Atomic int64_t      active_bytes; /* Currently allocated bytes        */
+    _Atomic int64_t      peak_bytes;   /* High-water mark                  */
+    size_t               obj_size;     /* Object size for this cache       */
+    struct pool_tag_entry *next;       /* Hash chain link                  */
+};
+
+/* Pool tag table configuration */
+#define POOL_TAG_HASH_SIZE  256  /* Hash buckets (power of 2)              */
+
+/*
+ * slab_alloc_tag — Allocate with pool tag tracking
+ *
+ * Like slab_alloc, but records the allocation under the given tag.
+ * Cache must be created with SLAB_POOL_TAGS flag.
+ * If cache lacks SLAB_POOL_TAGS, behaves like slab_alloc (tag ignored).
+ */
+void *slab_alloc_tag(struct slab_cache *cache, POOL_TAG tag);
+
+/*
+ * slab_free_tag — Free with pool tag accounting
+ *
+ * Like slab_free, but decrements the tag's active count.
+ * If cache lacks SLAB_POOL_TAGS, behaves like slab_free.
+ */
+void slab_free_tag(struct slab_cache *cache, void *obj, POOL_TAG tag);
+
+/*
+ * slab_pool_tag_stats — Print per-tag statistics (PoolMon-style)
+ *
+ * Dumps all active tags with alloc/free counts, active bytes, and peak.
+ * Output goes to stderr.
+ */
+void slab_pool_tag_stats(void);
+
+/*
+ * slab_pool_tag_find — Look up statistics for a specific tag
+ *
+ * Returns pointer to the entry, or NULL if tag has never been used.
+ * The returned pointer is valid until slab_system_fini().
+ */
+const struct pool_tag_entry *slab_pool_tag_find(POOL_TAG tag);
 
 #endif /* SLAB_H */

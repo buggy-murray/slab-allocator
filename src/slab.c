@@ -39,6 +39,9 @@
 static struct slab_cache *global_cache_list = NULL;
 static pthread_mutex_t global_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Forward declaration for pool tag cleanup */
+static void pool_tag_fini(void);
+
 /* Forward declarations for quarantine (v1.3) */
 static void quarantine_evict_one(struct slab_cache *cache);
 static void quarantine_flush(struct slab_cache *cache);
@@ -1130,4 +1133,187 @@ void slab_system_fini(void)
         slab_cache_destroy(c);
         c = next;
     }
+
+    /* Clean up pool tag table */
+    pool_tag_fini();
+}
+
+/* ──────────────────────────────────────────────────────────────────
+ * Pool tag tracking (v1.2) — NT-inspired allocation accounting
+ *
+ * Global hash table tracks per-tag statistics. Lock-free atomics for
+ * counters, mutex only for hash chain insertion (rare path).
+ *
+ * Inspired by NT's POOL_TRACKER_TABLE and the PoolMon tool.
+ * See: research/wrk-memory-manager-mm.md §2 (Pool Tag Tracking)
+ * ────────────────────────────────────────────────────────────────── */
+
+static struct pool_tag_entry *pool_tag_table[POOL_TAG_HASH_SIZE];
+static pthread_mutex_t pool_tag_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static inline uint32_t pool_tag_hash(POOL_TAG tag)
+{
+    /* Simple multiplicative hash — spread 4 bytes across bucket range */
+    uint32_t h = tag;
+    h ^= h >> 16;
+    h *= 0x45d9f3b;
+    h ^= h >> 16;
+    return h & (POOL_TAG_HASH_SIZE - 1);
+}
+
+/*
+ * Find or create a tag entry. Creation path takes the lock;
+ * lookup is a simple chain walk (safe with insert-at-head).
+ */
+static struct pool_tag_entry *pool_tag_get(POOL_TAG tag, size_t obj_size)
+{
+    uint32_t bucket = pool_tag_hash(tag);
+
+    /* Fast path: search existing chain (lock-free read) */
+    struct pool_tag_entry *e = pool_tag_table[bucket];
+    while (e) {
+        if (e->tag == tag)
+            return e;
+        e = e->next;
+    }
+
+    /* Slow path: create new entry under lock */
+    pthread_mutex_lock(&pool_tag_lock);
+
+    /* Re-check under lock (another thread may have inserted) */
+    e = pool_tag_table[bucket];
+    while (e) {
+        if (e->tag == tag) {
+            pthread_mutex_unlock(&pool_tag_lock);
+            return e;
+        }
+        e = e->next;
+    }
+
+    e = calloc(1, sizeof(struct pool_tag_entry));
+    if (!e) {
+        pthread_mutex_unlock(&pool_tag_lock);
+        return NULL;
+    }
+
+    e->tag = tag;
+    e->obj_size = obj_size;
+    atomic_store(&e->allocs, 0);
+    atomic_store(&e->frees, 0);
+    atomic_store(&e->active_bytes, 0);
+    atomic_store(&e->peak_bytes, 0);
+
+    /* Insert at head (makes lock-free reads safe) */
+    e->next = pool_tag_table[bucket];
+    pool_tag_table[bucket] = e;
+
+    pthread_mutex_unlock(&pool_tag_lock);
+    return e;
+}
+
+static void pool_tag_record_alloc(POOL_TAG tag, size_t obj_size)
+{
+    struct pool_tag_entry *e = pool_tag_get(tag, obj_size);
+    if (!e) return;
+
+    atomic_fetch_add(&e->allocs, 1);
+    int64_t active = atomic_fetch_add(&e->active_bytes, (int64_t)obj_size) + (int64_t)obj_size;
+
+    /* Update peak (CAS loop) */
+    int64_t peak = atomic_load(&e->peak_bytes);
+    while (active > peak) {
+        if (atomic_compare_exchange_weak(&e->peak_bytes, &peak, active))
+            break;
+    }
+}
+
+static void pool_tag_record_free(POOL_TAG tag, size_t obj_size)
+{
+    struct pool_tag_entry *e = pool_tag_get(tag, obj_size);
+    if (!e) return;
+
+    atomic_fetch_add(&e->frees, 1);
+    atomic_fetch_sub(&e->active_bytes, (int64_t)obj_size);
+}
+
+static void pool_tag_fini(void)
+{
+    pthread_mutex_lock(&pool_tag_lock);
+    for (int i = 0; i < POOL_TAG_HASH_SIZE; i++) {
+        struct pool_tag_entry *e = pool_tag_table[i];
+        while (e) {
+            struct pool_tag_entry *next = e->next;
+            free(e);
+            e = next;
+        }
+        pool_tag_table[i] = NULL;
+    }
+    pthread_mutex_unlock(&pool_tag_lock);
+}
+
+/* ── Public pool tag API ──────────────────────────────────────────── */
+
+void *slab_alloc_tag(struct slab_cache *cache, POOL_TAG tag)
+{
+    void *obj = slab_alloc(cache);
+    if (obj && (cache->flags & SLAB_POOL_TAGS)) {
+        pool_tag_record_alloc(tag, cache->raw_size);
+    }
+    return obj;
+}
+
+void slab_free_tag(struct slab_cache *cache, void *obj, POOL_TAG tag)
+{
+    if (obj && (cache->flags & SLAB_POOL_TAGS)) {
+        pool_tag_record_free(tag, cache->raw_size);
+    }
+    slab_free(cache, obj);
+}
+
+void slab_pool_tag_stats(void)
+{
+    fprintf(stderr,
+        "\n%-8s %10s %10s %10s %12s %12s\n",
+        "Tag", "Allocs", "Frees", "Active", "ActiveBytes", "PeakBytes");
+    fprintf(stderr,
+        "%-8s %10s %10s %10s %12s %12s\n",
+        "--------", "----------", "----------", "----------",
+        "------------", "------------");
+
+    for (int i = 0; i < POOL_TAG_HASH_SIZE; i++) {
+        struct pool_tag_entry *e = pool_tag_table[i];
+        while (e) {
+            uint64_t allocs = atomic_load(&e->allocs);
+            uint64_t frees  = atomic_load(&e->frees);
+            int64_t  active = atomic_load(&e->active_bytes);
+            int64_t  peak   = atomic_load(&e->peak_bytes);
+
+            /* Decode tag to printable chars */
+            char tag_str[5];
+            tag_str[0] = (char)(e->tag & 0xFF);
+            tag_str[1] = (char)((e->tag >> 8) & 0xFF);
+            tag_str[2] = (char)((e->tag >> 16) & 0xFF);
+            tag_str[3] = (char)((e->tag >> 24) & 0xFF);
+            tag_str[4] = '\0';
+
+            fprintf(stderr,
+                "%-8s %10lu %10lu %10lu %12ld %12ld\n",
+                tag_str, allocs, frees, allocs - frees, active, peak);
+
+            e = e->next;
+        }
+    }
+    fprintf(stderr, "\n");
+}
+
+const struct pool_tag_entry *slab_pool_tag_find(POOL_TAG tag)
+{
+    uint32_t bucket = pool_tag_hash(tag);
+    struct pool_tag_entry *e = pool_tag_table[bucket];
+    while (e) {
+        if (e->tag == tag)
+            return e;
+        e = e->next;
+    }
+    return NULL;
 }
