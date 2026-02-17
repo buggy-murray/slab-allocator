@@ -229,4 +229,21 @@ void slab_cache_stats(const struct slab_cache *cache);
 void slab_system_init(void);
 void slab_system_fini(void);
 
+/*
+ * Generic size-class allocator (v0.10) — kmalloc-style API
+ *
+ * Maintains internal caches for power-of-2 sizes (8 to 4096 bytes).
+ * slab_kmalloc() picks the smallest cache that fits the request.
+ * slab_kfree() returns the object to its cache (size must match).
+ *
+ * Must call slab_system_init() before first use.
+ * Thread-safe.
+ */
+#define SLAB_KMALLOC_MIN_SHIFT  3   /* 2^3 = 8 bytes   */
+#define SLAB_KMALLOC_MAX_SHIFT  12  /* 2^12 = 4096 bytes */
+#define SLAB_KMALLOC_CLASSES    (SLAB_KMALLOC_MAX_SHIFT - SLAB_KMALLOC_MIN_SHIFT + 1)
+
+void *slab_kmalloc(size_t size);
+void  slab_kfree(void *ptr, size_t size);
+
 #endif /* SLAB_H */

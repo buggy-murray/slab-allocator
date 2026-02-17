@@ -478,8 +478,39 @@ int main(void)
     test_multithreaded_no_mag();
     test_multithreaded_churn();
 
+    /* Test kmalloc-style API (v0.10) */
+    printf("\n=== test_kmalloc ===\n");
+    {
+        /* Test various sizes across all size classes */
+        size_t sizes[] = { 1, 7, 8, 15, 16, 33, 64, 100, 128, 256, 512, 1024, 2048, 4096 };
+        int nsizes = (int)(sizeof(sizes) / sizeof(sizes[0]));
+
+        for (int i = 0; i < nsizes; i++) {
+            void *p = slab_kmalloc(sizes[i]);
+            assert(p != NULL);
+            memset(p, 0xAA, sizes[i]);  /* Write to full requested size */
+            slab_kfree(p, sizes[i]);
+        }
+
+        /* Bulk alloc/free at different sizes */
+        void *ptrs[100];
+        for (int i = 0; i < 100; i++) {
+            ptrs[i] = slab_kmalloc(48);  /* Goes to size-64 cache */
+            assert(ptrs[i] != NULL);
+        }
+        for (int i = 0; i < 100; i++) {
+            slab_kfree(ptrs[i], 48);
+        }
+
+        /* Too-large allocation should return NULL */
+        void *big = slab_kmalloc(8192);
+        assert(big == NULL);
+
+        printf("  PASSED\n");
+    }
+
     slab_system_fini();
 
-    printf("All tests passed.\n");
+    printf("\nAll tests passed.\n");
     return 0;
 }

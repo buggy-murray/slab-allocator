@@ -935,6 +935,73 @@ void slab_cache_stats(const struct slab_cache *cache)
         total_objs ? (100.0 * used_objs / total_objs) : 0.0);
 }
 
+/* ──────────────────────────────────────────────────────────────────
+ * Generic size-class allocator (v0.10) — kmalloc-style API
+ *
+ * Power-of-2 caches from 8 to 4096 bytes. Lazily initialized on
+ * first use (protected by global_lock). Thread-safe after init.
+ * ────────────────────────────────────────────────────────────────── */
+
+static struct slab_cache *kmalloc_caches[SLAB_KMALLOC_CLASSES];
+static pthread_once_t kmalloc_once = PTHREAD_ONCE_INIT;
+
+static void kmalloc_init(void)
+{
+    static const char *names[] = {
+        "size-8", "size-16", "size-32", "size-64", "size-128",
+        "size-256", "size-512", "size-1024", "size-2048", "size-4096"
+    };
+
+    for (int i = 0; i < SLAB_KMALLOC_CLASSES; i++) {
+        size_t sz = (size_t)1 << (SLAB_KMALLOC_MIN_SHIFT + i);
+        kmalloc_caches[i] = slab_cache_create(names[i], sz, 0, 0, NULL, NULL);
+        if (!kmalloc_caches[i]) {
+            fprintf(stderr, "slab: FATAL: failed to create kmalloc cache %s\n", names[i]);
+        }
+    }
+}
+
+/*
+ * Find the smallest power-of-2 class that fits `size`.
+ * Returns the index into kmalloc_caches[], or -1 if too large.
+ */
+static inline int kmalloc_index(size_t size)
+{
+    if (size == 0) size = 1;
+    int shift = SLAB_KMALLOC_MIN_SHIFT;
+    while (shift <= SLAB_KMALLOC_MAX_SHIFT) {
+        if (size <= ((size_t)1 << shift))
+            return shift - SLAB_KMALLOC_MIN_SHIFT;
+        shift++;
+    }
+    return -1;  /* too large */
+}
+
+void *slab_kmalloc(size_t size)
+{
+    pthread_once(&kmalloc_once, kmalloc_init);
+
+    int idx = kmalloc_index(size);
+    if (idx < 0) {
+        fprintf(stderr, "slab: kmalloc(%zu) too large (max %d)\n",
+                size, 1 << SLAB_KMALLOC_MAX_SHIFT);
+        return NULL;
+    }
+    return slab_alloc(kmalloc_caches[idx]);
+}
+
+void slab_kfree(void *ptr, size_t size)
+{
+    if (!ptr) return;
+
+    int idx = kmalloc_index(size);
+    if (idx < 0) {
+        fprintf(stderr, "slab: kfree size %zu out of range\n", size);
+        return;
+    }
+    slab_free(kmalloc_caches[idx], ptr);
+}
+
 void slab_system_init(void)
 {
     pthread_mutex_lock(&global_lock);
