@@ -47,6 +47,20 @@ struct vmem_bt {
 /*
  * struct vmem — Arena descriptor
  */
+/*
+ * Span import callback: called when arena needs more resource.
+ * Should return 0 on success (and set *addrp), -1 on failure.
+ * @size is the minimum amount needed (may be rounded up).
+ */
+typedef int (*vmem_import_fn)(void *arg, size_t size, uintptr_t *addrp,
+                              size_t *actual_size);
+
+/*
+ * Span release callback: called when a fully-free imported span can
+ * be returned to the source.
+ */
+typedef void (*vmem_release_fn)(void *arg, uintptr_t addr, size_t size);
+
 typedef struct vmem {
     const char      *name;          /* Human-readable name              */
     size_t           quantum;       /* Minimum allocation unit          */
@@ -58,6 +72,12 @@ typedef struct vmem {
     /* Phase 2: segregated free lists with bitmap */
     struct vmem_bt   freelist[VMEM_FREELISTS];
     uint32_t         fl_bitmap;     /* Bitmap of non-empty free lists   */
+
+    /* Span import/release callbacks (optional) */
+    vmem_import_fn   import_fn;     /* Import more resource             */
+    vmem_release_fn  release_fn;    /* Release unused resource          */
+    void            *import_arg;    /* Opaque arg for callbacks         */
+    size_t           import_quantum;/* Min import size (>= quantum)     */
 
     /* Statistics */
     size_t           total_size;    /* Total resource under management  */
@@ -76,11 +96,17 @@ typedef struct vmem {
  * @base:    Start address of initial span (0 if none)
  * @size:    Size of initial span (0 if none)
  * @quantum: Minimum allocation unit (all sizes rounded up to quantum)
+ * @import_fn:  Optional callback to import more spans (NULL = no import)
+ * @release_fn: Optional callback to release empty spans (NULL = no release)
+ * @import_arg: Opaque argument passed to import/release callbacks
+ * @import_quantum: Minimum import size (0 = use quantum)
  *
  * Returns arena pointer, or NULL on failure.
  */
 vmem_t *vmem_create(const char *name, uintptr_t base, size_t size,
-                    size_t quantum);
+                    size_t quantum, vmem_import_fn import_fn,
+                    vmem_release_fn release_fn, void *import_arg,
+                    size_t import_quantum);
 
 /*
  * vmem_destroy — Destroy an arena and free all boundary tags

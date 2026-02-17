@@ -22,6 +22,7 @@
 
 #define _GNU_SOURCE
 #include "slab.h"
+#include "vmem.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,6 +100,26 @@ static void *pages_alloc_aligned(size_t slab_size, void **out_raw, size_t *out_r
 static void pages_free(void *raw_ptr, size_t raw_size)
 {
     munmap(raw_ptr, raw_size);
+}
+
+/*
+ * vmem-backed page allocation: uses vmem_xalloc for aligned slab pages.
+ * Returns aligned address; raw_mmap/raw_size store the vmem address/size.
+ */
+static void *pages_alloc_vmem(vmem_t *vm, size_t slab_size,
+                              void **out_raw, size_t *out_raw_size)
+{
+    uintptr_t addr;
+    if (vmem_xalloc(vm, slab_size, slab_size, 0, 0, 0, SIZE_MAX, &addr) != 0)
+        return NULL;
+    *out_raw = (void *)addr;
+    *out_raw_size = slab_size;
+    return (void *)addr;
+}
+
+static void pages_free_vmem(vmem_t *vm, void *ptr, size_t size)
+{
+    vmem_xfree(vm, (uintptr_t)ptr, size);
 }
 
 static inline struct slab *slab_from_obj(void *obj, size_t slab_size)
@@ -217,7 +238,11 @@ static struct slab *slab_new(struct slab_cache *cache)
 {
     void *raw;
     size_t raw_size;
-    void *mem = pages_alloc_aligned(cache->slab_size, &raw, &raw_size);
+    void *mem;
+    if (cache->vmem_source)
+        mem = pages_alloc_vmem(cache->vmem_source, cache->slab_size, &raw, &raw_size);
+    else
+        mem = pages_alloc_aligned(cache->slab_size, &raw, &raw_size);
     if (!mem)
         return NULL;
 
@@ -249,7 +274,10 @@ static void slab_release(struct slab_cache *cache, struct slab *s)
         }
     }
     cache->nr_slabs--;
-    pages_free(s->raw_mmap, s->raw_size);
+    if (cache->vmem_source)
+        pages_free_vmem(cache->vmem_source, s->raw_mmap, s->raw_size);
+    else
+        pages_free(s->raw_mmap, s->raw_size);
 }
 
 static void slab_list_remove(struct slab **head, struct slab *target)
@@ -721,6 +749,18 @@ struct slab_cache *slab_cache_create(const char *name, size_t size,
     global_cache_list = cache;
     pthread_mutex_unlock(&global_lock);
 
+    return cache;
+}
+
+struct slab_cache *slab_cache_create_vmem(const char *name, size_t size,
+                                           size_t align, uint32_t flags,
+                                           void (*ctor)(void *),
+                                           void (*dtor)(void *),
+                                           struct vmem *vmem_source)
+{
+    struct slab_cache *cache = slab_cache_create(name, size, align, flags, ctor, dtor);
+    if (cache)
+        cache->vmem_source = vmem_source;
     return cache;
 }
 

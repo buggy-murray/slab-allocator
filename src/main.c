@@ -9,10 +9,12 @@
 
 #define _GNU_SOURCE
 #include "slab.h"
+#include "vmem.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <pthread.h>
 
@@ -455,6 +457,25 @@ static void test_multithreaded_no_mag(void)
 
 /* ── Main ────────────────────────────────────────────────────── */
 
+/* vmem import/release callbacks for vmem-backed slab test */
+static int mmap_import(void *arg, size_t size, uintptr_t *addrp, size_t *actual)
+{
+    (void)arg;
+    size = (size + 4095) & ~(size_t)4095;
+    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return -1;
+    *addrp = (uintptr_t)p;
+    *actual = size;
+    return 0;
+}
+
+static void mmap_release(void *arg, uintptr_t addr, size_t size)
+{
+    (void)arg;
+    munmap((void *)addr, size);
+}
+
 int main(void)
 {
     printf("Slab Allocator Test Suite v0.6\n");
@@ -510,6 +531,42 @@ int main(void)
     }
 
     slab_system_fini();
+
+    /* ── Test vmem-backed slab cache ── */
+    {
+        printf("\n=== test_vmem_backed_slab ===\n");
+
+        vmem_t *vm = vmem_create("slab_pages", 0, 0, 4096,
+                                 mmap_import, mmap_release, NULL, 64 * 1024);
+
+        struct slab_cache *vc = slab_cache_create_vmem("vmem_test", 64, 0, 0,
+                                                        NULL, NULL, vm);
+        assert(vc != NULL);
+
+        /* Allocate and verify */
+        void *objs[200];
+        for (int i = 0; i < 200; i++) {
+            objs[i] = slab_alloc(vc);
+            assert(objs[i] != NULL);
+            memset(objs[i], (unsigned char)i, 64);
+        }
+
+        /* Verify data integrity */
+        for (int i = 0; i < 200; i++) {
+            unsigned char *p = objs[i];
+            assert(p[0] == (unsigned char)i);
+            assert(p[63] == (unsigned char)i);
+        }
+
+        /* Free all */
+        for (int i = 0; i < 200; i++)
+            slab_free(vc, objs[i]);
+
+        slab_cache_destroy(vc);
+        vmem_destroy(vm);
+
+        printf("  PASSED\n");
+    }
 
     printf("\nAll tests passed.\n");
     return 0;

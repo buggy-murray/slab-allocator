@@ -24,6 +24,9 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
+/* Forward declaration for vmem integration */
+struct vmem;
+
 /* Page size — matches typical x86-64/ARM64 */
 #define SLAB_PAGE_SIZE      4096
 #define SLAB_PAGE_SHIFT     12
@@ -167,6 +170,8 @@ struct slab_cache {
     struct cpu_depot  *cpu_depots;  /* Array[nr_cpus] of per-CPU depots    */
     uint32_t           nr_cpus;     /* Number of CPU depot slots           */
 
+    struct vmem      *vmem_source;  /* Optional vmem arena for page alloc   */
+
     struct slab_cache *next;        /* Global cache list                    */
 };
 
@@ -186,6 +191,19 @@ struct slab_cache *slab_cache_create(const char *name, size_t size,
                                       size_t align, uint32_t flags,
                                       void (*ctor)(void *),
                                       void (*dtor)(void *));
+
+/*
+ * slab_cache_create_vmem — Create a slab cache backed by a vmem arena
+ *
+ * Like slab_cache_create, but uses the given vmem arena for page
+ * allocation instead of direct mmap. The vmem arena should be configured
+ * with an import callback (e.g., mmap-backed) for automatic growth.
+ */
+struct slab_cache *slab_cache_create_vmem(const char *name, size_t size,
+                                           size_t align, uint32_t flags,
+                                           void (*ctor)(void *),
+                                           void (*dtor)(void *),
+                                           struct vmem *vmem_source);
 
 /*
  * slab_cache_destroy — Destroy a slab cache and free all memory

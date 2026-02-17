@@ -4,7 +4,7 @@ LDFLAGS = -lpthread -latomic
 SRCDIR  = src
 BUILD   = build
 
-SRCS    = $(SRCDIR)/slab.c $(SRCDIR)/main.c
+SRCS    = $(SRCDIR)/slab.c $(SRCDIR)/vmem.c $(SRCDIR)/main.c
 OBJS    = $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(SRCS))
 TARGET  = $(BUILD)/slab_test
 

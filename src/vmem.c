@@ -157,7 +157,9 @@ static struct vmem_bt *bt_coalesce(vmem_t *vm, struct vmem_bt *bt)
  * ────────────────────────────────────────────────────────────────── */
 
 vmem_t *vmem_create(const char *name, uintptr_t base, size_t size,
-                    size_t quantum)
+                    size_t quantum, vmem_import_fn import_fn,
+                    vmem_release_fn release_fn, void *import_arg,
+                    size_t import_quantum)
 {
     if (quantum == 0) quantum = 1;
 
@@ -166,6 +168,10 @@ vmem_t *vmem_create(const char *name, uintptr_t base, size_t size,
 
     vm->name    = name;
     vm->quantum = quantum;
+    vm->import_fn  = import_fn;
+    vm->release_fn = release_fn;
+    vm->import_arg = import_arg;
+    vm->import_quantum = import_quantum > 0 ? import_quantum : quantum;
 
     /* Initialize segment list sentinel (circular) */
     vm->seglist.seg_next = &vm->seglist;
@@ -287,8 +293,27 @@ int vmem_alloc(vmem_t *vm, size_t size, uintptr_t *addrp)
         mask &= mask - 1;  /* clear lowest bit, try next bucket */
     }
 
-    /* No fit found */
-    pthread_mutex_unlock(&vm->lock);
+    /* No fit found — try importing more resource */
+    if (vm->import_fn) {
+        size_t import_size = size;
+        if (import_size < vm->import_quantum)
+            import_size = vm->import_quantum;
+        import_size = roundup(import_size, vm->quantum);
+
+        uintptr_t import_addr;
+        size_t actual_size = import_size;
+
+        /* Must unlock before calling import (it may call mmap etc.) */
+        pthread_mutex_unlock(&vm->lock);
+
+        if (vm->import_fn(vm->import_arg, import_size, &import_addr, &actual_size) == 0) {
+            vmem_add(vm, import_addr, actual_size);
+            /* Retry the allocation */
+            return vmem_alloc(vm, size, addrp);
+        }
+    } else {
+        pthread_mutex_unlock(&vm->lock);
+    }
     return -1;
 
 found:
@@ -416,7 +441,27 @@ int vmem_xalloc(vmem_t *vm, size_t size, size_t align, size_t phase,
     }
 
     if (!best) {
-        pthread_mutex_unlock(&vm->lock);
+        /* Try importing more resource */
+        if (vm->import_fn) {
+            /* Need at least size + alignment overhead */
+            size_t import_size = size + align;
+            if (import_size < vm->import_quantum)
+                import_size = vm->import_quantum;
+            import_size = roundup(import_size, vm->quantum);
+
+            uintptr_t import_addr;
+            size_t actual_size = import_size;
+
+            pthread_mutex_unlock(&vm->lock);
+
+            if (vm->import_fn(vm->import_arg, import_size, &import_addr, &actual_size) == 0) {
+                vmem_add(vm, import_addr, actual_size);
+                return vmem_xalloc(vm, size, align, phase, nocross,
+                                   minaddr, maxaddr, addrp);
+            }
+        } else {
+            pthread_mutex_unlock(&vm->lock);
+        }
         return -1;
     }
 

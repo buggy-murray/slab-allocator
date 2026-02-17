@@ -19,7 +19,7 @@ static void test_basic(void)
 {
     printf("=== test_basic ===\n");
 
-    vmem_t *vm = vmem_create("test", 0x1000, 0x10000, 64);
+    vmem_t *vm = vmem_create("test", 0x1000, 0x10000, 64, NULL, NULL, NULL, 0);
     assert(vm != NULL);
 
     uintptr_t addr;
@@ -46,7 +46,7 @@ static void test_coalesce(void)
 {
     printf("=== test_coalesce ===\n");
 
-    vmem_t *vm = vmem_create("coalesce", 0, 4096, 64);
+    vmem_t *vm = vmem_create("coalesce", 0, 4096, 64, NULL, NULL, NULL, 0);
     assert(vm != NULL);
 
     /* Allocate 3 adjacent blocks */
@@ -79,7 +79,7 @@ static void test_exhaustion(void)
 {
     printf("=== test_exhaustion ===\n");
 
-    vmem_t *vm = vmem_create("exhaust", 0, 256, 64);
+    vmem_t *vm = vmem_create("exhaust", 0, 256, 64, NULL, NULL, NULL, 0);
     assert(vm != NULL);
 
     /* Fill the arena */
@@ -111,7 +111,7 @@ static void test_add_span(void)
 {
     printf("=== test_add_span ===\n");
 
-    vmem_t *vm = vmem_create("spans", 0, 128, 64);
+    vmem_t *vm = vmem_create("spans", 0, 128, 64, NULL, NULL, NULL, 0);
     assert(vm != NULL);
 
     /* Fill initial span */
@@ -143,7 +143,7 @@ static void test_xalloc_align(void)
 {
     printf("=== test_xalloc_align ===\n");
 
-    vmem_t *vm = vmem_create("xalloc", 0x100, 0x10000, 1);
+    vmem_t *vm = vmem_create("xalloc", 0x100, 0x10000, 1, NULL, NULL, NULL, 0);
     assert(vm != NULL);
 
     /* Allocate with 4096-byte alignment */
@@ -170,7 +170,7 @@ static void test_best_fit(void)
 {
     printf("=== test_best_fit ===\n");
 
-    vmem_t *vm = vmem_create("bestfit", 0, 1024, 64);
+    vmem_t *vm = vmem_create("bestfit", 0, 1024, 64, NULL, NULL, NULL, 0);
     assert(vm != NULL);
 
     /* Create fragmented layout: [alloc 64][free 128][alloc 64][free 256]... */
@@ -233,7 +233,7 @@ static void test_multithreaded(void)
 
     /* Large arena to avoid exhaustion: 8 threads * 10000 * 64 bytes active at once
      * is worst case ~5MB, but we free immediately so actual pressure is low */
-    vmem_t *vm = vmem_create("mt_test", 0, 16 * 1024 * 1024, MT_ALLOC_SIZE);
+    vmem_t *vm = vmem_create("mt_test", 0, 16 * 1024 * 1024, MT_ALLOC_SIZE, NULL, NULL, NULL, 0);
     assert(vm != NULL);
 
     pthread_t threads[MT_THREADS];
