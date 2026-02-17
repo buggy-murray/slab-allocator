@@ -8,9 +8,11 @@ SRCS    = $(SRCDIR)/slab.c $(SRCDIR)/main.c
 OBJS    = $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(SRCS))
 TARGET  = $(BUILD)/slab_test
 
-.PHONY: all clean run
+VMEM_TARGET = $(BUILD)/vmem_test
 
-all: $(TARGET)
+.PHONY: all clean run test
+
+all: $(TARGET) $(VMEM_TARGET)
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -21,8 +23,15 @@ $(BUILD)/%.o: $(SRCDIR)/%.c | $(BUILD)
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
+$(VMEM_TARGET): $(BUILD)/vmem.o $(BUILD)/vmem_test.o
+	$(CC) $(CFLAGS) $^ -o $@ -lpthread
+
 run: $(TARGET)
 	./$(TARGET)
+
+test: $(TARGET) $(VMEM_TARGET)
+	./$(TARGET)
+	./$(VMEM_TARGET)
 
 clean:
 	rm -rf $(BUILD)

@@ -17,31 +17,34 @@ and the Solaris magazine-based caching layer.
 - **Slab shrinking:** release empty cached slabs to the OS on demand
 - **Constructor/destructor** callbacks per object type
 
-- **Lock-free magazine depot** — CAS-based shared magazine exchange (v0.7)
+- **Lock-free per-CPU magazine depot** — CAS-based magazine exchange with per-CPU
+  partitioning to eliminate cross-CPU contention (v0.7/v0.8)
+- **Slab coloring** — rotate object offsets across slabs to reduce L1/L2 cache
+  set conflicts (v0.9)
+- **Generic kmalloc-style API** — `slab_kmalloc(size)` / `slab_kfree()` with
+  power-of-2 size classes from 8 to 4096 bytes (v0.10)
+- **Vmem arena allocator** — general-purpose resource manager with boundary tags,
+  segregated free lists, and constrained allocation (v1.0)
 
 ## Architecture
 
 ```
-Thread 1                Thread 2                Thread N
-    |                       |                       |
-[Magazine]             [Magazine]              [Magazine]     ← Layer 1: TLS (no sync)
-    |                       |                       |
-    +--------+--------------+-----------+-----------+
-                            |
-                    ┌───────┴───────┐
-                    │  Lock-Free    │
-                    │    Depot      │                          ← Layer 2: CAS atomics
-                    │ (full/empty   │
-                    │  mag stacks)  │
-                    └───────┬───────┘
-                            |
-                        [mutex]                               ← Layer 3: mutex
-                            |
-                   +--------+--------+
-                   | partial | full  |
-                   |  slabs  | slabs |
-                   +---------+-------+
-                       slab_cache
+Thread A (CPU 0)       Thread B (CPU 1)       Thread C (CPU 0)
+    |                      |                      |
+[TLS Magazine]        [TLS Magazine]         [TLS Magazine]    ← Layer 1: no sync
+    |                      |                      |
+[CPU 0 Depot]         [CPU 1 Depot]          [CPU 0 Depot]     ← Layer 2: per-CPU CAS
+  full/empty            full/empty             (same depot)
+    |                      |                      |
+    +----------------------+----------------------+
+                           |
+                       [mutex]                                  ← Layer 3: mutex
+                           |
+                  +--------+--------+
+                  | partial | full  |
+                  |  slabs  | slabs |
+                  +---------+-------+
+                      slab_cache
 ```
 
 **Fast path (no lock):** alloc pops from thread-local magazine; free pushes to it.
@@ -65,9 +68,16 @@ Requires: GCC (C11), pthreads, libatomic (ARM64), Linux/macOS with mmap support.
 ### Benchmarks
 
 ```bash
-# Build and run benchmarks (requires libjemalloc-dev for jemalloc comparison)
-gcc -O2 -std=c11 src/bench.c src/slab.c -o build/bench -lpthread -latomic -ljemalloc -ldl
+# Build and run benchmarks (jemalloc loaded via dlopen if available)
+gcc -O2 -std=c11 src/bench.c src/slab.c -o build/bench -lpthread -latomic -ldl
 ./build/bench
+```
+
+### Vmem Tests
+
+```bash
+gcc -O2 -std=c11 src/vmem.c src/vmem_test.c -o build/vmem_test -lpthread
+./build/vmem_test
 ```
 
 ## API
@@ -92,6 +102,21 @@ slab_cache_stats(cache);
 
 // Destroy cache (all objects must be freed first)
 slab_cache_destroy(cache);
+
+// --- Generic allocation (kmalloc-style, v0.10) ---
+void *buf = slab_kmalloc(100);   // → routes to "size-128" cache
+slab_kfree(buf, 100);
+
+// --- Vmem arena (v1.0) ---
+#include "vmem.h"
+
+vmem_t *vm = vmem_create("my_arena", 0x10000, 0x100000, 4096);
+uintptr_t addr;
+vmem_alloc(vm, 8192, &addr);           // simple allocation
+vmem_xalloc(vm, 4096, 4096, 0, 0,      // aligned allocation
+            0, SIZE_MAX, &addr);
+vmem_free(vm, addr, 4096);
+vmem_destroy(vm);
 ```
 
 ### Flags
@@ -124,18 +149,20 @@ Measured on ARM64 (Docker, Linux 6.12, GCC 12, `-O2`). Object size: 64 bytes.
 | malloc (glibc) | 5 | 6 |
 | jemalloc | 8 | 6 |
 
-### Multi-Threaded Churn (64 alloc + 64 free per round)
+### Multi-Threaded Churn (64 alloc + 64 free per round, v0.8 per-CPU depots)
 
-| Threads | slab (ns/op) | malloc (ns/op) | jemalloc (ns/op) |
-|---------|-------------|----------------|-----------------|
-| 1 | 3 | 2 | 3 |
-| 4 | 3 | 1 | 1 |
-| 8 | 6 | <1 | 1 |
+| Threads | slab (ns/op) | malloc (ns/op) |
+|---------|-------------|----------------|
+| 1 | 3 | 5 |
+| 2 | 2 | 3 |
+| 4 | 1 | 1 |
+| 8 | **1** | 1 |
 
-**Key insight:** The slab allocator's warm steady-state performance (3.4 ns) beats
-both malloc and jemalloc. The apparent slowness in bulk benchmarks is entirely from
-one-time cold start costs (mmap, slab initialization). Magazine caching reduces
-free latency by **400×** compared to no-magazine mode.
+**Key insights:**
+- **Steady-state beats malloc:** 5 ns/roundtrip vs 6 ns for glibc malloc
+- **Near-perfect MT scaling:** 1 ns/op at 8 threads with per-CPU depots
+- Per-CPU depots (v0.8) eliminated the contention bottleneck — **6× improvement** over v0.7's global depot
+- Magazine caching reduces free latency by **400×** vs no-magazine mode
 
 ## Design References
 
@@ -156,6 +183,10 @@ free latency by **400×** compared to no-magazine mode.
 | v0.5 | `slab_cache_shrink()` |
 | v0.6 | Thread-safe with per-thread magazine caching |
 | v0.7 | Lock-free magazine depot (C11 atomics, ABA-safe CAS) |
+| v0.8 | Per-CPU depot partitioning (6× MT improvement) |
+| v0.9 | Slab coloring for cache line conflict reduction |
+| v0.10 | Generic kmalloc-style size-class API |
+| v1.0 | Vmem arena allocator (boundary tags, instant-fit, constrained alloc) |
 
 ## License
 
