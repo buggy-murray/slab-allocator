@@ -618,6 +618,74 @@ int main(void)
         printf("  PASSED\n");
     }
 
+    /* ── test_pool_tags_integrated ──────────────────────────────── */
+    {
+        printf("\n=== test_pool_tags_integrated ===\n");
+
+        #define TAG_NET  MAKE_POOL_TAG('N','e','t','X')
+        #define TAG_OBJ  MAKE_POOL_TAG('O','b','j','M')
+        #define TAG_TMP  MAKE_POOL_TAG('T','m','p','!')
+
+        struct slab_cache *tc = slab_cache_create("tag-test", 64, 0,
+            SLAB_POOL_TAGS | SLAB_NO_MAGAZINES, NULL, NULL);
+        assert(tc);
+
+        /* Allocate with different tags */
+        void *n1 = slab_alloc_tag(tc, TAG_NET);
+        void *n2 = slab_alloc_tag(tc, TAG_NET);
+        void *o1 = slab_alloc_tag(tc, TAG_OBJ);
+        void *t1 = slab_alloc_tag(tc, TAG_TMP);
+        void *t2 = slab_alloc_tag(tc, TAG_TMP);
+        void *t3 = slab_alloc_tag(tc, TAG_TMP);
+        assert(n1 && n2 && o1 && t1 && t2 && t3);
+
+        /* Check NET tag: 2 allocs, 0 frees, 128 active bytes */
+        const struct pool_tag_entry *net = slab_pool_tag_find(TAG_NET);
+        assert(net);
+        assert(atomic_load(&net->allocs) == 2);
+        assert(atomic_load(&net->frees) == 0);
+        assert(atomic_load(&net->active_bytes) == 128);  /* 2 * 64 */
+
+        /* Check TMP tag: 3 allocs */
+        const struct pool_tag_entry *tmp = slab_pool_tag_find(TAG_TMP);
+        assert(tmp);
+        assert(atomic_load(&tmp->allocs) == 3);
+        assert(atomic_load(&tmp->active_bytes) == 192);  /* 3 * 64 */
+
+        /* Free some and verify accounting */
+        slab_free_tag(tc, t1, TAG_TMP);
+        slab_free_tag(tc, t2, TAG_TMP);
+        assert(atomic_load(&tmp->frees) == 2);
+        assert(atomic_load(&tmp->active_bytes) == 64);   /* 1 remaining */
+        assert(atomic_load(&tmp->peak_bytes) == 192);    /* Peak was 3 */
+
+        /* Free the rest */
+        slab_free_tag(tc, n1, TAG_NET);
+        slab_free_tag(tc, n2, TAG_NET);
+        slab_free_tag(tc, o1, TAG_OBJ);
+        slab_free_tag(tc, t3, TAG_TMP);
+
+        /* All freed — active should be 0 */
+        assert(atomic_load(&net->active_bytes) == 0);
+        assert(atomic_load(&tmp->active_bytes) == 0);
+
+        const struct pool_tag_entry *obj = slab_pool_tag_find(TAG_OBJ);
+        assert(obj);
+        assert(atomic_load(&obj->allocs) == 1);
+        assert(atomic_load(&obj->frees) == 1);
+        assert(atomic_load(&obj->active_bytes) == 0);
+
+        /* Dump stats */
+        slab_pool_tag_stats();
+
+        slab_cache_destroy(tc);
+        printf("  PASSED\n");
+
+        #undef TAG_NET
+        #undef TAG_OBJ
+        #undef TAG_TMP
+    }
+
     printf("\nAll tests passed.\n");
     return 0;
 }
