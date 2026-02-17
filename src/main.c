@@ -686,6 +686,39 @@ int main(void)
         #undef TAG_TMP
     }
 
+    /* ── test_verify_invariants ─────────────────────────────────── */
+    {
+        printf("\n=== test_verify_invariants ===\n");
+
+        struct slab_cache *vc = slab_cache_create("verify-test", 48, 0,
+            SLAB_NO_MAGAZINES, NULL, NULL);
+        assert(vc);
+
+        /* Empty cache — should pass */
+        assert(slab_cache_verify(vc) == 0);
+
+        /* Allocate some objects to create partial/full slabs */
+        void *objs[200];
+        for (int i = 0; i < 200; i++) {
+            objs[i] = slab_alloc(vc);
+            assert(objs[i]);
+        }
+        assert(slab_cache_verify(vc) == 0);
+
+        /* Free half — creates mix of partial and full */
+        for (int i = 0; i < 100; i++)
+            slab_free(vc, objs[i]);
+        assert(slab_cache_verify(vc) == 0);
+
+        /* Free all — should have only free slabs */
+        for (int i = 100; i < 200; i++)
+            slab_free(vc, objs[i]);
+        assert(slab_cache_verify(vc) == 0);
+
+        slab_cache_destroy(vc);
+        printf("  PASSED\n");
+    }
+
     printf("\nAll tests passed.\n");
     return 0;
 }

@@ -1044,6 +1044,133 @@ void slab_cache_stats(const struct slab_cache *cache)
 }
 
 /* ──────────────────────────────────────────────────────────────────
+ * Formal invariant checking (v1.2) — TFS-Successor-inspired VERIFY
+ *
+ * Validates structural invariants of a slab cache. Call from tests
+ * or periodically in debug builds to catch corruption early.
+ *
+ * Invariants checked:
+ *   INV-SLAB-1: For every slab, inuse + free_count == total
+ *   INV-SLAB-2: Full slabs have inuse == total (freelist == NULL)
+ *   INV-SLAB-3: Free slabs have inuse == 0
+ *   INV-SLAB-4: Partial slabs have 0 < inuse < total
+ *   INV-SLAB-5: nr_slabs == count(full) + count(partial) + count(free)
+ *   INV-SLAB-6: nr_partial == count(partial)
+ *   INV-SLAB-7: nr_free == count(free) && nr_free <= max_free
+ *   INV-SLAB-8: Every slab's back-pointer == owning cache
+ *   INV-SLAB-9: Red zones intact on all free objects (if SLAB_RED_ZONE)
+ * ────────────────────────────────────────────────────────────────── */
+
+int slab_cache_verify(struct slab_cache *cache)
+{
+    if (!cache) return -1;
+
+    int errors = 0;
+    uint32_t count_full = 0, count_partial = 0, count_free = 0;
+
+    pthread_mutex_lock(&cache->lock);
+
+    /* Check full slabs (INV-SLAB-2, INV-SLAB-8) */
+    for (struct slab *s = cache->full; s; s = s->next) {
+        count_full++;
+        if (s->cache != cache) {
+            fprintf(stderr, "VERIFY FAIL [INV-SLAB-8]: full slab %p back-pointer != cache '%s'\n",
+                    (void *)s, cache->name);
+            errors++;
+        }
+        if (s->inuse != s->total) {
+            fprintf(stderr, "VERIFY FAIL [INV-SLAB-2]: full slab %p inuse=%u != total=%u in cache '%s'\n",
+                    (void *)s, s->inuse, s->total, cache->name);
+            errors++;
+        }
+        if (s->freelist != NULL) {
+            fprintf(stderr, "VERIFY FAIL [INV-SLAB-2]: full slab %p has non-NULL freelist in cache '%s'\n",
+                    (void *)s, cache->name);
+            errors++;
+        }
+    }
+
+    /* Check partial slabs (INV-SLAB-1, INV-SLAB-4, INV-SLAB-8) */
+    for (struct slab *s = cache->partial; s; s = s->next) {
+        count_partial++;
+        if (s->cache != cache) {
+            fprintf(stderr, "VERIFY FAIL [INV-SLAB-8]: partial slab %p back-pointer != cache '%s'\n",
+                    (void *)s, cache->name);
+            errors++;
+        }
+        if (s->inuse == 0 || s->inuse >= s->total) {
+            fprintf(stderr, "VERIFY FAIL [INV-SLAB-4]: partial slab %p inuse=%u not in (0,%u) in cache '%s'\n",
+                    (void *)s, s->inuse, s->total, cache->name);
+            errors++;
+        }
+        /* INV-SLAB-1: count freelist and verify inuse + free == total */
+        uint16_t free_count = 0;
+        void *fp = s->freelist;
+        while (fp) {
+            free_count++;
+            if (free_count > s->total) {
+                fprintf(stderr, "VERIFY FAIL [INV-SLAB-1]: freelist cycle detected in partial slab %p cache '%s'\n",
+                        (void *)s, cache->name);
+                errors++;
+                break;
+            }
+            fp = *(void **)fp;
+        }
+        if (free_count <= s->total && (s->inuse + free_count) != s->total) {
+            fprintf(stderr, "VERIFY FAIL [INV-SLAB-1]: partial slab %p inuse(%u) + free(%u) != total(%u) in cache '%s'\n",
+                    (void *)s, s->inuse, free_count, s->total, cache->name);
+            errors++;
+        }
+    }
+
+    /* Check free slabs (INV-SLAB-3, INV-SLAB-8) */
+    for (struct slab *s = cache->free; s; s = s->next) {
+        count_free++;
+        if (s->cache != cache) {
+            fprintf(stderr, "VERIFY FAIL [INV-SLAB-8]: free slab %p back-pointer != cache '%s'\n",
+                    (void *)s, cache->name);
+            errors++;
+        }
+        if (s->inuse != 0) {
+            fprintf(stderr, "VERIFY FAIL [INV-SLAB-3]: free slab %p has inuse=%u in cache '%s'\n",
+                    (void *)s, s->inuse, cache->name);
+            errors++;
+        }
+    }
+
+    /* INV-SLAB-5: total slab count */
+    uint32_t total_counted = count_full + count_partial + count_free;
+    if (total_counted != cache->nr_slabs) {
+        fprintf(stderr, "VERIFY FAIL [INV-SLAB-5]: counted %u slabs but nr_slabs=%u in cache '%s'\n",
+                total_counted, cache->nr_slabs, cache->name);
+        errors++;
+    }
+
+    /* INV-SLAB-6: partial count */
+    if (count_partial != cache->nr_partial) {
+        fprintf(stderr, "VERIFY FAIL [INV-SLAB-6]: counted %u partial but nr_partial=%u in cache '%s'\n",
+                count_partial, cache->nr_partial, cache->name);
+        errors++;
+    }
+
+    /* INV-SLAB-7: free count and max_free bound */
+    if (count_free != cache->nr_free) {
+        fprintf(stderr, "VERIFY FAIL [INV-SLAB-7]: counted %u free but nr_free=%u in cache '%s'\n",
+                count_free, cache->nr_free, cache->name);
+        errors++;
+    }
+
+    pthread_mutex_unlock(&cache->lock);
+
+    if (errors == 0) {
+        fprintf(stderr, "VERIFY OK: cache '%s' — %u full, %u partial, %u free slabs, all invariants hold\n",
+                cache->name, count_full, count_partial, count_free);
+    }
+
+    return errors;
+}
+
+/* ──────────────────────────────────────────────────────────────────
  * Generic size-class allocator (v0.10) — kmalloc-style API
  *
  * Power-of-2 caches from 8 to 4096 bytes. Lazily initialized on

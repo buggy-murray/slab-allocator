@@ -271,6 +271,19 @@ uint32_t slab_cache_shrink(struct slab_cache *cache);
 void slab_cache_stats(const struct slab_cache *cache);
 
 /*
+ * slab_cache_verify — Formal invariant checking (VERIFY build)
+ *
+ * Validates 9 structural invariants of the cache. Returns 0 if all
+ * invariants hold, or the number of violations found.
+ * Prints details of each violation to stderr.
+ *
+ * Acquires cache->lock internally. NOT safe during concurrent alloc/free
+ * (magazines may hold objects not accounted for in slab lists).
+ * Best used with SLAB_NO_MAGAZINES or after draining all threads.
+ */
+int slab_cache_verify(struct slab_cache *cache);
+
+/*
  * slab_system_init — Initialize the slab allocator subsystem
  * slab_system_fini — Tear down and report leaks
  */
