@@ -39,6 +39,10 @@
 static struct slab_cache *global_cache_list = NULL;
 static pthread_mutex_t global_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Forward declarations for quarantine (v1.3) */
+static void quarantine_evict_one(struct slab_cache *cache);
+static void quarantine_flush(struct slab_cache *cache);
+
 static inline size_t align_up(size_t val, size_t align)
 {
     return (val + align - 1) & ~(align - 1);
@@ -801,6 +805,13 @@ void slab_cache_destroy(struct slab_cache *cache)
     }
     free(cache->cpu_depots);
 
+    /* Flush quarantine (v1.3) */
+    if (cache->flags & SLAB_QUARANTINE) {
+        pthread_mutex_lock(&cache->lock);
+        quarantine_flush(cache);
+        pthread_mutex_unlock(&cache->lock);
+    }
+
     struct slab *s, *next;
 
     for (s = cache->full; s; s = next) {
@@ -886,10 +897,58 @@ void *slab_alloc(struct slab_cache *cache)
     return user;
 }
 
+/*
+ * quarantine_evict_one — Evict the oldest object from quarantine and truly free it.
+ * Must hold cache->lock.
+ */
+static void quarantine_evict_one(struct slab_cache *cache)
+{
+    uint16_t oldest = (cache->quar_head + SLAB_QUARANTINE_SIZE - cache->quar_count)
+                      % SLAB_QUARANTINE_SIZE;
+    void *evicted_ptr = cache->quarantine[oldest];
+    cache->quar_count--;
+
+    void *obj = user_to_obj(cache, evicted_ptr);
+    slab_free_slow(cache, obj);
+}
+
+/*
+ * quarantine_flush — Evict all objects from quarantine.
+ * Must hold cache->lock.
+ */
+static void quarantine_flush(struct slab_cache *cache)
+{
+    while (cache->quar_count > 0)
+        quarantine_evict_one(cache);
+}
+
 void slab_free(struct slab_cache *cache, void *ptr)
 {
     if (!cache || !ptr)
         return;
+
+    /* Quarantine path (v1.3): defer reuse to catch use-after-free */
+    if (cache->flags & SLAB_QUARANTINE) {
+        void *obj = user_to_obj(cache, ptr);
+
+        pthread_mutex_lock(&cache->lock);
+
+        red_zone_check(cache, obj);
+        poison_free(cache, obj);
+
+        /* If quarantine full, evict oldest first */
+        if (cache->quar_count >= SLAB_QUARANTINE_SIZE)
+            quarantine_evict_one(cache);
+
+        /* Add to quarantine ring buffer */
+        cache->quarantine[cache->quar_head] = ptr;
+        cache->quar_head = (cache->quar_head + 1) % SLAB_QUARANTINE_SIZE;
+        cache->quar_count++;
+        cache->quar_total++;
+
+        pthread_mutex_unlock(&cache->lock);
+        return;
+    }
 
     /* Fast path: push to per-thread magazine */
     if (!(cache->flags & SLAB_NO_MAGAZINES)) {
@@ -973,6 +1032,12 @@ void slab_cache_stats(const struct slab_cache *cache)
         cache->nr_slabs, cache->nr_partial, cache->nr_free,
         used_objs, total_objs,
         total_objs ? (100.0 * used_objs / total_objs) : 0.0);
+
+    if (cache->flags & SLAB_QUARANTINE) {
+        fprintf(stderr,
+            "  quarantine: %u/%u slots used, %lu lifetime entries\n",
+            cache->quar_count, SLAB_QUARANTINE_SIZE, cache->quar_total);
+    }
 }
 
 /* ──────────────────────────────────────────────────────────────────

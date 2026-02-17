@@ -10,6 +10,8 @@
  *        Each CPU gets its own lock-free depot stacks (full/empty).
  * v0.9: Slab coloring — rotate object start offset across slabs to reduce
  *        L1/L2 cache set conflicts between same-index objects.
+ * v1.3: Quarantine — deferred reuse of freed objects to catch use-after-free.
+ *        Freed objects stay poisoned in a ring buffer before returning to freelist.
  *
  * Author: G.H. Murray
  * Date:   2026-02-16
@@ -48,6 +50,9 @@ struct vmem;
 /* Per-thread magazine flags */
 #define SLAB_NO_MAGAZINES   0x04   /* Disable per-thread caching                    */
 
+/* Quarantine (v1.3) — deferred reuse for use-after-free detection */
+#define SLAB_QUARANTINE     0x08   /* Enable quarantine for freed objects            */
+
 /* Debug magic values */
 #define SLAB_RED_MAGIC      0xBB   /* Red zone fill byte                            */
 #define SLAB_POISON_FREE    0x6B   /* Free object poison (like Linux's POISON_FREE)  */
@@ -63,6 +68,9 @@ struct vmem;
 
 /* Slab coloring (v0.9) */
 #define SLAB_CACHE_LINE     64     /* Default L1 cache line size (bytes)             */
+
+/* Quarantine configuration (v1.3) */
+#define SLAB_QUARANTINE_SIZE 64    /* Max objects in quarantine per cache             */
 
 /*
  * struct slab — Represents a single slab (one or more pages)
@@ -171,6 +179,12 @@ struct slab_cache {
     uint32_t           nr_cpus;     /* Number of CPU depot slots           */
 
     struct vmem      *vmem_source;  /* Optional vmem arena for page alloc   */
+
+    /* Quarantine ring buffer (v1.3) — protected by cache->lock */
+    void             *quarantine[SLAB_QUARANTINE_SIZE];
+    uint16_t          quar_head;    /* Next slot to write                   */
+    uint16_t          quar_count;   /* Current entries in quarantine        */
+    uint64_t          quar_total;   /* Lifetime quarantine entries          */
 
     struct slab_cache *next;        /* Global cache list                    */
 };
