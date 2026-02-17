@@ -192,15 +192,16 @@ static bool poison_check_free(struct slab_cache *cache, void *obj)
  * Slab management (caller must hold cache->lock)
  * ────────────────────────────────────────────────────────────────── */
 
-static void slab_init(struct slab *s, struct slab_cache *cache)
+static void slab_init(struct slab *s, struct slab_cache *cache, uint16_t colour_off)
 {
     size_t header = align_up(sizeof(struct slab), cache->align);
 
-    s->cache    = cache;
-    s->next     = NULL;
-    s->inuse    = 0;
-    s->total    = cache->objs_per_slab;
-    s->base     = (char *)s + header;
+    s->cache      = cache;
+    s->next       = NULL;
+    s->inuse      = 0;
+    s->total      = cache->objs_per_slab;
+    s->colour_off = colour_off;
+    s->base       = (char *)s + header + colour_off;
 
     s->freelist = s->base;
     for (uint16_t i = 0; i < s->total - 1; i++) {
@@ -223,7 +224,14 @@ static struct slab *slab_new(struct slab_cache *cache)
     struct slab *s = (struct slab *)mem;
     s->raw_mmap = raw;
     s->raw_size = raw_size;
-    slab_init(s, cache);
+
+    /* Assign slab color (v0.9) — rotate through available colors */
+    uint16_t colour_off = cache->colour_next * cache->colour_off;
+    cache->colour_next++;
+    if (cache->colour_next > cache->colour)
+        cache->colour_next = 0;
+
+    slab_init(s, cache, colour_off);
     cache->nr_slabs++;
     return s;
 }
@@ -664,6 +672,16 @@ struct slab_cache *slab_cache_create(const char *name, size_t size,
 
     cache->obj_size  = align_up(effective, align);
     cache->slab_size = compute_slab_size(cache->obj_size, &cache->objs_per_slab);
+
+    /* Compute slab coloring (v0.9) */
+    {
+        size_t header   = align_up(sizeof(struct slab), align);
+        size_t used     = header + (size_t)cache->objs_per_slab * cache->obj_size;
+        size_t leftover = (cache->slab_size > used) ? cache->slab_size - used : 0;
+        cache->colour_off  = SLAB_CACHE_LINE;
+        cache->colour      = (uint16_t)(leftover / SLAB_CACHE_LINE);
+        cache->colour_next = 0;
+    }
 
     /* Initialize mutex */
     pthread_mutex_init(&cache->lock, NULL);

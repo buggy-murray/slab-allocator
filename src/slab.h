@@ -8,6 +8,8 @@
  *        Per-thread magazines swap with depot (CAS) instead of mutex.
  * v0.8: Per-CPU depot partitioning to eliminate cross-CPU CAS contention.
  *        Each CPU gets its own lock-free depot stacks (full/empty).
+ * v0.9: Slab coloring — rotate object start offset across slabs to reduce
+ *        L1/L2 cache set conflicts between same-index objects.
  *
  * Author: G.H. Murray
  * Date:   2026-02-16
@@ -56,6 +58,9 @@
 /* Per-CPU depot configuration (v0.8) */
 #define SLAB_MAX_CPUS       256    /* Hard cap on CPU depot array size               */
 
+/* Slab coloring (v0.9) */
+#define SLAB_CACHE_LINE     64     /* Default L1 cache line size (bytes)             */
+
 /*
  * struct slab — Represents a single slab (one or more pages)
  */
@@ -68,6 +73,7 @@ struct slab {
     void             *base;         /* Base address of object region        */
     void             *raw_mmap;     /* Original mmap pointer (for munmap)   */
     size_t            raw_size;     /* Original mmap size (for munmap)      */
+    uint16_t          colour_off;   /* Coloring offset applied (bytes)      */
 };
 
 /*
@@ -149,6 +155,11 @@ struct slab_cache {
 
     void (*ctor)(void *obj);        /* Optional object constructor          */
     void (*dtor)(void *obj);        /* Optional object destructor           */
+
+    /* Slab coloring (v0.9) */
+    uint16_t          colour;       /* Max color index (leftover / line)    */
+    uint16_t          colour_off;   /* Bytes per color step (cache line)    */
+    uint16_t          colour_next;  /* Next color to assign (wraps)         */
 
     pthread_key_t     mag_key;      /* TLS key for per-thread magazine      */
 
